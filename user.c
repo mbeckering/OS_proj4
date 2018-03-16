@@ -10,21 +10,28 @@
 #include <stdlib.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
+#include <sys/msg.h>
+#include <sys/types.h>
+#include <signal.h>
 
 #define BILLION 1000000000 //dont want to type the wrong # of zeroes
 #define SHMKEY_sim_s 4020012
 #define SHMKEY_sim_ns 4020013
 #define SHMKEY_pct 4020014
 #define BUFF_SZ sizeof (unsigned int)
+#define MSGQKEY_oss 4020069
 
 /****************************FUNCTION PROTOTYPES *****************************/
-void getSharedMemory();
+void getIPC(); //Attach shared memory (allocated by OSS) to local vars
+static void siginthandler(int); //SIGINT handler
 
 /***************************** GLOBALS ***************************************/
 int shmid_sim_secs, shmid_sim_ns; //shared memory ID holders for sim clock
-int shmid_pct;
+int shmid_pct; //shared memory id holder for process control table
+int oss_qid; //message queue ID for OSS communications
 static unsigned int *simClock_secs; 
 static unsigned int *simClock_ns; //pointers to shm sim clock values
+unsigned int myStartTimeSecs, myStartTimeNS; //to deduce my LIFEtime later
 
 struct pcb { // Process control block struct
     unsigned int totalCPUtime_secs;
@@ -32,27 +39,49 @@ struct pcb { // Process control block struct
     unsigned int totalLIFEtime_secs;
     unsigned int totalLIFEtime_ns;
     unsigned int timeUsedLastBurst_ns;
+    int blocked; // 1=blocked, 0= not blocked
+    unsigned int blockedUntilSecs;
+    unsigned int blockedUntilNS;
     int localPID;
     int isRealTimeClass; // 1 = realtime class process
 };
 
-struct pcb * pct; //pct = process control table (array of 18 process
+struct pcb * pct; //pct = process control table (array of process
                   //control blocks)
+
+//struct for communications message queue
+struct commsbuf {
+    long msgtype;
+    unsigned int ossTimeSliceGivenNS; //from oss. time slice given to run
+    int userTerminatingFlag; //from user. 1=terminating, 0=not terminating
+    int userUsedFullTimeSliceFlag; //fromuser. 1=used full time slice
+};
 
 /********************************* MAIN **************************************/
 int main(int argc, char** argv) {
     shmid_pct = atoi(argv[1]);
-    getSharedMemory();
-    printf("User: seconds: %u nanoseconds: %u\n", *simClock_secs, *simClock_ns);
-    printf("User: process id %d, isRealTime = %d\n", 
-        pct[1].localPID, pct[1].isRealTimeClass);
-    printf("User: process id %d, isRealTime = %d\n", 
-        pct[17].localPID, pct[17].isRealTimeClass);
+    struct commsbuf myinfo;
+    
+    // Set up interrupt handler
+    signal (SIGINT, siginthandler);
+    
+    getIPC();
+    myStartTimeSecs = *simClock_secs; 
+    myStartTimeNS = *simClock_ns;
+    
+    if ( msgrcv(oss_qid, &myinfo, sizeof(myinfo), 1, 1) == -1 ) {
+            perror("User: error in msgrcv");
+            exit(0);
+        }
+    
+    printf("User: msgtype %ld, timeslice %u\n",  myinfo.msgtype, myinfo.ossTimeSliceGivenNS);
+    
+    
 
     return (EXIT_SUCCESS);
 }
 
-void getSharedMemory() {
+void getIPC() {
     //process control table
     pct = (struct pcb *)shmat(shmid_pct, 0, 0);
     if ( pct == (struct pcb *)(-1) ) {
@@ -75,5 +104,16 @@ void getSharedMemory() {
             exit(1);
         }
     simClock_ns = (unsigned int*) shmat(shmid_sim_ns, 0, 0);
+    
+    //message queue
+    if ( (oss_qid = msgget(MSGQKEY_oss, 0777)) == -1 ) {
+        perror("Error generating communication message queue");
+        exit(0);
+    }
 }
 
+//SIGINT handler
+static void siginthandler(int sig_num) {
+    printf("Slave(pid %ld) Terminating: Interrupted.\n", getpid());
+    exit(0);
+}

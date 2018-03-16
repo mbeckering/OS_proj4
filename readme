@@ -1,1 +1,7 @@
+https://github.com/mbeckering/OS_proj4.git
 
+Globals:
+I used a LOT of globals in order to delegate more work to functions. The last 
+couple projects got very long and I found myself scrolling through lots of 
+code and struggling to find my core operations. I know over-using globals is 
+generally a bad thing, but I thought I would experiment this time around.

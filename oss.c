@@ -6,6 +6,8 @@
  * Created on March 15, 2018, 10:35 AM
  */
 
+/******************* INCLUDES & DEFINITIONS ***********************************/
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -17,33 +19,43 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <string.h>
+#include <time.h>
 
 #define BILLION 1000000000 //dont want to type the wrong # of zeroes
 #define SHMKEY_sim_s 4020012
 #define SHMKEY_sim_ns 4020013
 #define SHMKEY_pct 4020014
+#define MSGQKEY_oss 4020069
 #define BUFF_SZ sizeof (unsigned int)
 
-
-/********************** Function prototypes **********************************/
+/*********************** Function prototypes **********************************/
 
 void makePCB(int pidnum, int isRealTime); //initializes a new PCB
 void initBitVector(int); //initilize bit vector
-void allocateSharedMemory(); //allocate shared memory
+void allocateIPC(); //allocate shared memory
 void clearIPC(); //clear shared memory and message queues
 void initQueue(int[], int); //initialize queues, takes queue name and size
+static int setperiodic(double); //timed interrupt handler
+static int setinterrupt(); //SIGALRM handler
+static void interrupt(int signo, siginfo_t *info, void *context); //actions
+static void siginthandler(int sig_num); //SIGINT handler
+void setTimeToNextProc(); //rolls AND stores sim clock time for next user exec
 
-/************************ Global variables ***********************************/
+/************************* Global variables ***********************************/
 
-int bitVector[18]; // Bit vector indicating used PCB's
+int bitVector[19]; // Bit vector indicating used PCB's
 int shmid_sim_secs, shmid_sim_ns; //shared memory ID holders for sim clock
 int shmid_pct; //shared memory id holder for process control table
+int oss_qid; //message queue ID for OSS communications
 static unsigned int *simClock_secs; //pointer to shm sim clock (seconds)
 static unsigned int *simClock_ns; //pointer to shm sim clock (nanoseconds)
-int queue0[18]; //Round Robin queue for realtime processes
-int queue1[18]; //high-priority queue
-int queue2[18]; //medium-priority queue
-int queue3[18]; //low-priority queue
+int queue0[19]; //Round Robin queue for realtime processes
+int queue1[19]; //high-priority queue
+int queue2[19]; //medium-priority queue
+int queue3[19]; //low-priority queue
+unsigned int maxTimeBetweenProcsNS, maxTimeBetweenProcsSecs;
+unsigned int timeToNextProcNS, timeToNextProcSecs, seed;
+unsigned int spawnNextProcNS, spawnNextProcSecs;
 
 struct pcb { // Process control block struct
     unsigned int totalCPUtime_secs;
@@ -51,30 +63,66 @@ struct pcb { // Process control block struct
     unsigned int totalLIFEtime_secs;
     unsigned int totalLIFEtime_ns;
     unsigned int timeUsedLastBurst_ns;
+    int blocked;  // 1=blocked, 0= not blocked
+    unsigned int blockedUntilSecs;
+    unsigned int blockedUntilNS;
     int localPID;
     int isRealTimeClass; // 1 = realtime class process
+};
+
+//struct for communications message queue
+struct commsbuf {
+    long msgtype;
+    unsigned int ossTimeSliceGivenNS; //from oss. time slice given to run
+    int userTerminatingFlag; //from user. 1=terminating, 0=not terminating
+    int userUsedFullTimeSliceFlag; //fromuser. 1=used full time slice
 };
 
 struct pcb * pct; //pct = process control table (array of 18 process
                   //control blocks)
 
-/*************************** MAIN ********************************************/
+/**************************** MAIN ********************************************/
 
 int main(int argc, char** argv) {
-    pid_t childpid;
-    char str_pct_id[20];
+    maxTimeBetweenProcsNS = 999999998;
+    maxTimeBetweenProcsSecs = 1;
+    struct commsbuf infostruct;
+    seed = (unsigned int) getpid(); //use my pid as first rand seed
+    double runtime = 3; // Seconds before timeout interrupt & termination
+    int arraysize = 18 + 1; //so I can use local sim pids 1-18 without confusion
+    pid_t childpid; //holder for childpid, used when determining child fork
+    char str_pct_id[20]; //string argument sent to users, holds shmid for pct
     
-    allocateSharedMemory();
-    initBitVector(18);
-    initQueue(queue0, 18);
-    initQueue(queue1, 18);
-    initQueue(queue2, 18);
-    initQueue(queue3, 18);
+    // Set up ctrl^c interrupt handling
+    signal (SIGINT, siginthandler);
+    //set up interrupt timer
+    if (setinterrupt() == -1) {
+        perror("Failed to set up SIGALRM handler");
+        return 1;
+    }
+    // Set up periodic timer
+    if (setperiodic(runtime) == -1) {
+        perror("Failed to setup periodic interrupt");
+        return 1;
+    }
+    
+    //Set up shared memory and initialize bitvector and queues
+    allocateIPC();
+    initBitVector(arraysize);
+    initQueue(queue0, arraysize);
+    initQueue(queue1, arraysize);
+    initQueue(queue2, arraysize);
+    initQueue(queue3, arraysize);
+    
+    setTimeToNextProc();
+    printf("First user will spawn at %u:%u\n", 
+    spawnNextProcSecs, spawnNextProcNS);
+    
+    //go ahead and increment sim clock to spawn first user (no mutex needed)
+    *simClock_secs = spawnNextProcSecs;
+    *simClock_ns = spawnNextProcNS;
     
     makePCB(1, 1); //pid1, realtime = yes
-    
-    *simClock_secs = 1;
-    *simClock_ns = 12345;
     
     if ( (childpid = fork()) < 0 ){ //terminate code
                 perror("Error forking consumer");
@@ -87,11 +135,18 @@ int main(int argc, char** argv) {
             return 0;
         }
     
-    sleep(1);
+    infostruct.msgtype = 1;
+    infostruct.ossTimeSliceGivenNS = 69420;
+    infostruct.userTerminatingFlag = 0;
+    infostruct.userUsedFullTimeSliceFlag = 0;
     
-    unsigned int local_secs = *simClock_secs;
-    unsigned int local_ns = *simClock_ns;
-    printf("OSS: seconds: %u, ns: %u \n", local_secs, local_ns);
+    if ( msgsnd(oss_qid, &infostruct, sizeof(infostruct), 0) == -1 ) {
+        perror("OSS: error sending init msg");
+        clearIPC();
+        exit(0);
+    }
+    
+    sleep(1);
     
     clearIPC();
     printf("OSS: Normal exit\n");
@@ -99,7 +154,16 @@ int main(int argc, char** argv) {
     return (EXIT_SUCCESS);
 }
 
-/************************** END MAIN *****************************************/
+/*************************** END MAIN *****************************************/
+
+//sets length of sim time from now until next child process spawn
+//AND sets variables to indicate when that time will be on the sim clock
+void setTimeToNextProc() {
+    timeToNextProcSecs = rand_r(&seed) % (maxTimeBetweenProcsSecs + 1);
+    timeToNextProcNS = rand_r(&seed) % (maxTimeBetweenProcsNS + 1);
+    spawnNextProcSecs = *simClock_secs + timeToNextProcSecs;
+    spawnNextProcNS = *simClock_ns + timeToNextProcNS;
+}
 
 //makePCB initializes a new process control block and sets bit vector
 //accepts simulated pid number and whether or not it's a realtime class process
@@ -109,7 +173,10 @@ void makePCB(int pidnum, int isRealTime) {
     pct[pidnum].totalLIFEtime_secs = 0;
     pct[pidnum].totalLIFEtime_ns = 0;
     pct[pidnum].timeUsedLastBurst_ns = 0;
-    pct[pidnum].localPID = pidnum; //pids will be 1-18, not 0-17
+    pct[pidnum].blocked = 0;
+    pct[pidnum].blockedUntilSecs = 0;
+    pct[pidnum].blockedUntilNS = 0;
+    pct[pidnum].localPID = pidnum; //pids will be 1-18
     pct[pidnum].isRealTimeClass = isRealTime;
     bitVector[pidnum] = 1; //mark this pcb taken in bit vector
     printf("OSS: Generated process id %d, isRealTime = %d\n", 
@@ -126,15 +193,14 @@ void initBitVector(int n) {
 }
 
 // Function to set up shared memory
-void allocateSharedMemory() {
+void allocateIPC() {
     printf("OSS: Allocating shared memory\n");
     //process control table
-    shmid_pct = shmget(SHMKEY_pct, 18*sizeof(struct pcb), 0777 | IPC_CREAT);
+    shmid_pct = shmget(SHMKEY_pct, 19*sizeof(struct pcb), 0777 | IPC_CREAT);
      if (shmid_pct == -1) { //terminate if shmget failed
             perror("OSS: error in shmget shmid_pct");
             exit(1);
         }
-    
     pct = (struct pcb *)shmat(shmid_pct, 0, 0);
     if ( pct == (struct pcb *)(-1) ) {
         perror("OSS: error in shmat pct");
@@ -155,6 +221,12 @@ void allocateSharedMemory() {
             exit(1);
         }
     simClock_ns = (unsigned int*) shmat(shmid_sim_ns, 0, 0);
+    
+    //message queue
+    if ( (oss_qid = msgget(MSGQKEY_oss, 0777 | IPC_CREAT)) == -1 ) {
+        perror("Error generating communication message queue");
+        exit(0);
+    }
 }
 
 // Function to clear shared memory
@@ -171,16 +243,11 @@ void clearIPC() {
     if ( shmctl(shmid_pct, IPC_RMID, NULL) == -1) {
         perror("error removing shared memory");
     }
-    /*
-    if ( msgctl(mutex_qid, IPC_RMID, NULL) == -1 ) {
-        perror("Master: Error removing mutex_qid");
+
+    if ( msgctl(oss_qid, IPC_RMID, NULL) == -1 ) {
+        perror("OSS: Error removing ODD message queue");
         exit(0);
     }
-    if ( msgctl(comms_qid, IPC_RMID, NULL) == -1 ) {
-        perror("Master: Error removing comms_qid");
-        exit(0);
-    }
-    */
 }
 
 void initQueue(int q[], int size) {
@@ -190,5 +257,60 @@ void initQueue(int q[], int size) {
     }
 }
 
+/********************* INTERRUPT HANDLING *************************************/
 
+//this function taken from UNIX text
+static int setperiodic(double sec) {
+    timer_t timerid;
+    struct itimerspec value;
+    
+    if (timer_create(CLOCK_REALTIME, NULL, &timerid) == -1)
+        return -1;
+    value.it_interval.tv_sec = (long)sec;
+    value.it_interval.tv_nsec = (sec - value.it_interval.tv_sec)*BILLION;
+    if (value.it_interval.tv_nsec >= BILLION) {
+        value.it_interval.tv_sec++;
+        value.it_interval.tv_nsec -= BILLION;
+    }
+    value.it_value = value.it_interval;
+    return timer_settime(timerid, 0, &value, NULL);
+}
+
+//this function taken from UNIX text
+static int setinterrupt() {
+    struct sigaction act;
+    
+    act.sa_flags = SA_SIGINFO;
+    act.sa_sigaction = interrupt;
+    if ((sigemptyset(&act.sa_mask) == -1) ||
+            (sigaction(SIGALRM, &act, NULL) == -1))
+        return -1;
+    return 0;
+}
+
+//action taken after timed interrupt is detected
+static void interrupt(int signo, siginfo_t *info, void *context) {
+    printf("OSS: Timer Interrupt Detected! signo = %d\n", signo);
+    //killchildren();
+    clearIPC();
+    //close log file
+    //fprintf(mlog, "OSS: Terminated: Timed Out\n");
+    //fclose(mlog);
+    printf("OSS: Terminated: Timed Out\n");
+    exit(0);
+}
+
+//SIGINT handler
+static void siginthandler(int sig_num) {
+    printf("OSS: Ctrl+C interrupt detected! signo = %d\n", sig_num);
+    
+    //killchildren();
+    clearIPC();
+    
+    //fprintf(mlog, "OSS: Terminated: Interrupted\n");
+    //fclose(mlog);
+    
+    printf("OSS: Terminated: Interrupted\n");
+    exit(0);
+}
 
