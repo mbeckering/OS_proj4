@@ -8,6 +8,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <sys/msg.h>
@@ -24,6 +25,7 @@
 /****************************FUNCTION PROTOTYPES *****************************/
 void getIPC(); //Attach shared memory (allocated by OSS) to local vars
 static void siginthandler(int); //SIGINT handler
+int roll100(); //returns an int in range 1-100
 
 /***************************** GLOBALS ***************************************/
 int shmid_sim_secs, shmid_sim_ns; //shared memory ID holders for sim clock
@@ -32,6 +34,8 @@ int oss_qid; //message queue ID for OSS communications
 static unsigned int *simClock_secs; 
 static unsigned int *simClock_ns; //pointers to shm sim clock values
 unsigned int myStartTimeSecs, myStartTimeNS; //to deduce my LIFEtime later
+int my_sim_pid; //this user's simulated pid (1-18)
+int seed;
 
 struct pcb { // Process control block struct
     unsigned int totalCPUtime_secs;
@@ -51,7 +55,8 @@ struct pcb * pct; //pct = process control table (array of process
 
 //struct for communications message queue
 struct commsbuf {
-    long msgtype;
+    long msgtyp;
+    int user_sim_pid;
     unsigned int ossTimeSliceGivenNS; //from oss. time slice given to run
     int userTerminatingFlag; //from user. 1=terminating, 0=not terminating
     int userUsedFullTimeSliceFlag; //fromuser. 1=used full time slice
@@ -59,26 +64,51 @@ struct commsbuf {
 
 /********************************* MAIN **************************************/
 int main(int argc, char** argv) {
-    shmid_pct = atoi(argv[1]);
     struct commsbuf myinfo;
+    shmid_pct = atoi(argv[1]);
+    my_sim_pid = atoi(argv[2]);
+    printf("User my_sim_pid %d spawned.\n", my_sim_pid);
     
     // Set up interrupt handler
     signal (SIGINT, siginthandler);
     
+    //get IPC info and read clock for my start time
     getIPC();
     myStartTimeSecs = *simClock_secs; 
     myStartTimeNS = *simClock_ns;
     
-    if ( msgrcv(oss_qid, &myinfo, sizeof(myinfo), 1, 1) == -1 ) {
+    while(1) {
+        printf("User my_sim_pid %d: waiting for message...\n", my_sim_pid);
+        if ( msgrcv(oss_qid, &myinfo, sizeof(myinfo), 1, my_sim_pid) == -1 ) {
             perror("User: error in msgrcv");
             exit(0);
         }
     
-    printf("User: msgtype %ld, timeslice %u\n",  myinfo.msgtype, myinfo.ossTimeSliceGivenNS);
+        printf("User: Message received: msgtyp %ld, timeslice %u\n",  myinfo.msgtyp, myinfo.ossTimeSliceGivenNS);
+    
+        myinfo.userTerminatingFlag = 0;
+        myinfo.userUsedFullTimeSliceFlag = 1;
+        myinfo.user_sim_pid = my_sim_pid;
+        myinfo.msgtyp = 99;
+    
+        sleep(1);
+        
+        printf("User: sending message to oss...\n");
+        if ( msgsnd(oss_qid, &myinfo, sizeof(myinfo), 0) == -1 ) {
+            perror("User: error sending msg to oss");
+            exit(0);
+        }
+    }
     
     
 
     return (EXIT_SUCCESS);
+}
+
+int roll100() {
+    int return_val;
+    return_val = rand_r(&seed) % (100 + 1);
+    return return_val;
 }
 
 void getIPC() {
