@@ -26,6 +26,10 @@
 void getIPC(); //Attach shared memory (allocated by OSS) to local vars
 static void siginthandler(int); //SIGINT handler
 int roll100(); //returns an int in range 1-100
+void reportFinishedTimeSlice();
+void reportTermination();
+void reportInterrupt();
+unsigned int randomPortionOfTimeSlice();
 
 /***************************** GLOBALS ***************************************/
 int shmid_sim_secs, shmid_sim_ns; //shared memory ID holders for sim clock
@@ -60,11 +64,13 @@ struct commsbuf {
     unsigned int ossTimeSliceGivenNS; //from oss. time slice given to run
     int userTerminatingFlag; //from user. 1=terminating, 0=not terminating
     int userUsedFullTimeSliceFlag; //fromuser. 1=used full time slice
+    unsigned int userTimeUsedLastBurst; //from user, time in ns that it ran
 };
+
+struct commsbuf myinfo;
 
 /********************************* MAIN **************************************/
 int main(int argc, char** argv) {
-    struct commsbuf myinfo;
     shmid_pct = atoi(argv[1]);
     my_sim_pid = atoi(argv[2]);
     printf("User my_sim_pid %d spawned.\n", my_sim_pid);
@@ -78,31 +84,61 @@ int main(int argc, char** argv) {
     myStartTimeNS = *simClock_ns;
     
     while(1) {
-        printf("User my_sim_pid %d: waiting for message...\n", my_sim_pid);
         if ( msgrcv(oss_qid, &myinfo, sizeof(myinfo), 1, my_sim_pid) == -1 ) {
             perror("User: error in msgrcv");
             exit(0);
         }
-    
-        printf("User: Message received: msgtyp %ld, timeslice %u\n",  myinfo.msgtyp, myinfo.ossTimeSliceGivenNS);
-    
-        myinfo.userTerminatingFlag = 0;
-        myinfo.userUsedFullTimeSliceFlag = 1;
-        myinfo.user_sim_pid = my_sim_pid;
-        myinfo.msgtyp = 99;
-    
-        sleep(1);
         
-        printf("User: sending message to oss...\n");
-        if ( msgsnd(oss_qid, &myinfo, sizeof(myinfo), 0) == -1 ) {
-            perror("User: error sending msg to oss");
-            exit(0);
+        if (roll100() <= 10) {
+            printf("user %d rolled to terminate!\n", myinfo.user_sim_pid);
+            sleep(1);
+            reportFinishedTimeSlice();
         }
+    
+        
+        //sleep(1);
+
     }
     
     
 
     return (EXIT_SUCCESS);
+}
+
+void reportFinishedTimeSlice() {
+    myinfo.userTerminatingFlag = 0;
+    myinfo.userUsedFullTimeSliceFlag = 1;
+    myinfo.userTimeUsedLastBurst = myinfo.ossTimeSliceGivenNS;
+    myinfo.user_sim_pid = my_sim_pid;
+    myinfo.msgtyp = 99;
+    
+    if ( msgsnd(oss_qid, &myinfo, sizeof(myinfo), 0) == -1 ) {
+        perror("User: error sending msg to oss");
+        exit(0);
+    }
+}
+
+void reportTermination() {
+    myinfo.userTerminatingFlag = 1;
+    myinfo.userUsedFullTimeSliceFlag = 0;
+    myinfo.userTimeUsedLastBurst = randomPortionOfTimeSlice();
+    myinfo.user_sim_pid = my_sim_pid;
+    myinfo.msgtyp = 99;
+    
+    if ( msgsnd(oss_qid, &myinfo, sizeof(myinfo), 0) == -1 ) {
+        perror("User: error sending msg to oss");
+        exit(0);
+    }
+}
+
+unsigned int randomPortionOfTimeSlice() {
+    unsigned int return_val;
+    return_val = rand_r(&seed) % (myinfo.ossTimeSliceGivenNS + 1);
+    return return_val;
+}
+
+void reportInterrupt() {
+    
 }
 
 int roll100() {
@@ -144,6 +180,6 @@ void getIPC() {
 
 //SIGINT handler
 static void siginthandler(int sig_num) {
-    printf("Slave(pid %ld) Terminating: Interrupted.\n", getpid());
+    printf("User realpid:%ld Terminating: Interrupted.\n", getpid());
     exit(0);
 }

@@ -43,9 +43,12 @@ void setTimeToNextProc(); //rolls AND stores sim clock time for next user exec
 int isTimeToSpawnProc(); //checks to see if it's time to spawn another process
 int getOpenBitVector(); //finds open spot in bit vector, returns -1 if full
 int roll100(); //returns an into (1-100 range)
+void incrementSimClockAfterMessageReceipt(int);
+void spawnNewUser();
 
 /************************* Global variables ***********************************/
 
+pid_t childpids[20]; // Real-world pid values for killing children if necessary
 int bitVector[19]; // Bit vector indicating used PCB's
 int shmid_sim_secs, shmid_sim_ns; //shared memory ID holders for sim clock
 int shmid_pct; //shared memory id holder for process control table
@@ -59,6 +62,10 @@ int queue3[19]; //low-priority queue
 unsigned int maxTimeBetweenProcsNS, maxTimeBetweenProcsSecs;
 unsigned int timeToNextProcNS, timeToNextProcSecs, seed;
 unsigned int spawnNextProcNS, spawnNextProcSecs;
+unsigned int quantum_0 = 2000000; //time quantums: 2ms, 4ms, 8ms, 16ms
+unsigned int quantum_1 = 4000000; 
+unsigned int quantum_2 = 8000000;
+unsigned int quantum_3 = 16000000;
 
 struct pcb { // Process control block struct
     unsigned int totalCPUtime_secs;
@@ -80,7 +87,10 @@ struct commsbuf {
     unsigned int ossTimeSliceGivenNS; //from oss. time slice given to run
     int userTerminatingFlag; //from user. 1=terminating, 0=not terminating
     int userUsedFullTimeSliceFlag; //from user. 1=used full time slice
+    unsigned int userTimeUsedLastBurst; //from user, time in ns that it ran
 };
+
+struct commsbuf infostruct;
 
 struct pcb * pct; //pct = process control table (array of 18 process
                   //control blocks)
@@ -90,7 +100,6 @@ struct pcb * pct; //pct = process control table (array of 18 process
 int main(int argc, char** argv) {
     maxTimeBetweenProcsNS = 999999998;
     maxTimeBetweenProcsSecs = 1;
-    struct commsbuf infostruct;
     seed = (unsigned int) getpid(); //use my pid as first rand seed
     double runtime = 10; // Seconds before timeout interrupt & termination
     int arraysize = 18 + 1; //so I can use local sim pids 1-18 without confusion
@@ -98,10 +107,6 @@ int main(int argc, char** argv) {
     char str_pct_id[20]; //string argument sent to users, holds shmid for pct
     char str_user_sim_pid[4]; // string arg for user's simulated pid (1-18)
     int user_sim_pid;
-    unsigned int quantum_0 = 2000000; //time quantums: 2ms, 4ms, 8ms, 16ms
-    unsigned int quantum_1 = 4000000; 
-    unsigned int quantum_2 = 8000000;
-    unsigned int quantum_3 = 16000000;
     
     // Set up ctrl^c interrupt handling
     signal (SIGINT, siginthandler);
@@ -132,7 +137,7 @@ int main(int argc, char** argv) {
     *simClock_secs = spawnNextProcSecs;
     *simClock_ns = spawnNextProcNS;
     
-    //setTimeToNextProc(); *****************NO NEW TIME TO SPAWN RIGHT NOW
+    setTimeToNextProc();
     
     //******************** TEMP TESTING CODE******************************************************************************
     makePCB(1, 1); //pid1, realtime = yes
@@ -140,59 +145,55 @@ int main(int argc, char** argv) {
     infostruct.ossTimeSliceGivenNS = quantum_0;
     infostruct.userTerminatingFlag = 0;
     infostruct.userUsedFullTimeSliceFlag = 0;
-    user_sim_pid = 1;
+    infostruct.user_sim_pid = 1;
     if ( (childpid = fork()) < 0 ){ //terminate code
                 perror("OSS: Error forking user");
                 return 0;
             }
-            if (childpid == 0) { //child code
-                printf("OSS: execcing child\n");
-                sprintf(str_pct_id, "%d", shmid_pct); //build arg1 string
-                sprintf(str_user_sim_pid, "%d", user_sim_pid);
-                execlp("./user", "./user", str_pct_id, str_user_sim_pid, (char *)NULL);
-                perror("OSS: execl() failure"); //report & exit if exec fails
-                return 0;
-            }
-    //******************** TEMP TESTING CODE******************************************************************************
-    
-    while (1) {
-        printf("OSS: Sending message to user.\n");
-        infostruct.msgtyp = 1;
+    if (childpid == 0) { //child code
+        printf("OSS: execcing child\n");
+        sprintf(str_pct_id, "%d", shmid_pct); //build arg1 string
+        sprintf(str_user_sim_pid, "%d", infostruct.user_sim_pid);
+        execlp("./user", "./user", str_pct_id, str_user_sim_pid, (char *)NULL);
+        perror("OSS: execl() failure"); //report & exit if exec fails
+        return 0;
+    }
+    childpids[1] = childpid;
+    printf("OSS: Sending FIRST message to user.\n");
+        infostruct.msgtyp = (long)infostruct.user_sim_pid;
         if ( msgsnd(oss_qid, &infostruct, sizeof(infostruct), 0) == -1 ) {
             perror("OSS: error sending init msg");
             clearIPC();
             exit(0);
         }
-        
+    //******************** TEMP TESTING CODE******************************************************************************
+    
+    while (1) {
         //wait for a message from user (Always msgtyp 99)
         if ( msgrcv(oss_qid, &infostruct, sizeof(infostruct), 99, 0) == -1 ) {
             perror("User: error in msgrcv");
             clearIPC();
             exit(0);
         }
-        printf("OSS: Message received from user %d, looping.\n", infostruct.user_sim_pid);
+        pct[infostruct.user_sim_pid].timeUsedLastBurst_ns = infostruct.userTimeUsedLastBurst;
+        incrementSimClockAfterMessageReceipt(infostruct.user_sim_pid);
+        printf("OSS: Message received from user %d, ran %u, clock now %ld:%ld\n", 
+                infostruct.user_sim_pid, infostruct.userTimeUsedLastBurst, *simClock_secs, *simClock_ns);
         //spawn a user process if it's time AND there's an open spot
-        /*
         if (isTimeToSpawnProc() && (getOpenBitVector() != -1) ) {
-            user_sim_pid = getOpenBitVector();
-            makePCB (user_sim_pid, 1);
-            if ( (childpid = fork()) < 0 ){ //terminate code
-                perror("OSS: Error forking user");
-                return 0;
-            }
-            if (childpid == 0) { //child code
-                sprintf(str_pct_id, "%d", shmid_pct); //build arg1 string
-                sprintf(str_user_sim_pid, "%d", user_sim_pid);
-                execlp("./user", "./user", str_pct_id, user_sim_pid, (char *)NULL);
-                perror("OSS: execl() failure"); //report & exit if exec fails
-                return 0;
-            }
+            spawnNewUser();
         }
-        //if it's time but there's no open space, set a new time to spawn
+        //if it's time but there's no open space, only set a new time to spawn
         else if (isTimeToSpawnProc() && (getOpenBitVector() == -1) ) {
             setTimeToNextProc();
         }
-        */
+        
+        infostruct.msgtyp = 1;
+        if ( msgsnd(oss_qid, &infostruct, sizeof(infostruct), 0) == -1 ) {
+            perror("OSS: error sending init msg");
+            clearIPC();
+            exit(0);
+        }
         
     
     }
@@ -205,13 +206,69 @@ int main(int argc, char** argv) {
 
 /*************************** END MAIN *****************************************/
 
+/*************************** FUNCTIONS ****************************************/
+
+void spawnNewUser() {
+    char str_pct_id[20]; //string argument sent to users, holds shmid for pct
+    char str_user_sim_pid[4]; // string arg for user's simulated pid (1-18)
+    int user_sim_pid;
+    pid_t childpid;
+    setTimeToNextProc();
+    user_sim_pid = getOpenBitVector();
+    infostruct.msgtyp = user_sim_pid;
+    infostruct.ossTimeSliceGivenNS = quantum_0;
+    infostruct.userTerminatingFlag = 0;
+    infostruct.userUsedFullTimeSliceFlag = 0;
+    infostruct.user_sim_pid = user_sim_pid;
+    makePCB (user_sim_pid, 1);
+    if ( (childpid = fork()) < 0 ){ //terminate code
+        perror("OSS: Error forking user");
+        return 0;
+    }
+    if (childpid == 0) { //child code
+        sprintf(str_pct_id, "%d", shmid_pct); //build arg1 string
+        sprintf(str_user_sim_pid, "%d", user_sim_pid);
+        execlp("./user", "./user", str_pct_id, str_user_sim_pid, (char *)NULL);
+        perror("OSS: execl() failure"); //report & exit if exec fails
+        return 0;
+    }
+    childpids[user_sim_pid] = childpid;
+}
+
+void incrementSimClockAfterMessageReceipt(int userpid) {
+    unsigned int localsec = *simClock_secs;
+    unsigned int localns = *simClock_ns;
+    unsigned int temp;
+    localns = localns + 100; //increment 100ns for oss operations
+    //increment last user burst
+    localns = localns + pct[userpid].timeUsedLastBurst_ns;
+    
+    if (localns >= BILLION) { //roll ns to s if > bill ********************************************
+        localsec++;
+        temp = localns - BILLION;
+        localns = temp;
+    }
+    
+    *simClock_secs = localsec;
+    *simClock_ns = localns;
+}
 //sets length of sim time from now until next child process spawn
-//AND sets variables to indicate when that time will be on the sim clock
+//AND sets variables to indicate when that time will be on the sim clock****************************
 void setTimeToNextProc() {
+    unsigned int temp;
+    unsigned int localsecs = *simClock_secs;
+    unsigned int localns = *simClock_ns;
     timeToNextProcSecs = rand_r(&seed) % (maxTimeBetweenProcsSecs + 1);
     timeToNextProcNS = rand_r(&seed) % (maxTimeBetweenProcsNS + 1);
-    spawnNextProcSecs = *simClock_secs + timeToNextProcSecs;
-    spawnNextProcNS = *simClock_ns + timeToNextProcNS;
+    spawnNextProcSecs = localsecs + timeToNextProcSecs;
+    spawnNextProcNS = localns + timeToNextProcNS;
+    if (spawnNextProcNS >= BILLION) { //roll ns to s if > bill
+        spawnNextProcSecs++;
+        temp = spawnNextProcNS - BILLION;
+        spawnNextProcNS = temp;
+    }
+    
+    printf("OSS SET NEXT PROC FUNCTION: Next user will spawn at %ld:%ld\n", spawnNextProcSecs, spawnNextProcNS );
 }
 
 int roll100() {
@@ -222,10 +279,13 @@ int roll100() {
 
 int isTimeToSpawnProc() {
     int return_val = 0;
-    if ( (*simClock_secs > spawnNextProcSecs) || 
-            ( (*simClock_ns >= spawnNextProcNS) && (*simClock_secs >= spawnNextProcSecs))) {
+    unsigned int localsec = *simClock_secs;
+    unsigned int localns = *simClock_ns;
+    if ( (localsec > spawnNextProcSecs) || 
+            ( (localsec >= spawnNextProcSecs) && (localns >= spawnNextProcNS) ) ) {
         return_val = 1;
     }
+    printf("OSS SPAWN CHECK FUNCTION: time: %ld:%ld next: %ld:%ld isTimeToSpawnProc = %d\n", localsec, localns, spawnNextProcSecs, spawnNextProcNS, return_val);
     return return_val;
 }
 
@@ -234,10 +294,11 @@ int getOpenBitVector() {
     int return_val = -1;
     for (i=1; i<19; i++) {
         if (bitVector[i] == 0) {
-            return_val = bitVector[i];
+            return_val = i;
             break;
         }
     }
+    printf("BITVECTOR FUNCTION: Open bit vector result: %d\n", return_val);
     return return_val;
 }
 
