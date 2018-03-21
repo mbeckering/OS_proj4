@@ -42,9 +42,16 @@ static void siginthandler(int sig_num); //SIGINT handler
 void setTimeToNextProc(); //rolls AND stores sim clock time for next user exec
 int isTimeToSpawnProc(); //checks to see if it's time to spawn another process
 int getOpenBitVector(); //finds open spot in bit vector, returns -1 if full
-int roll100(); //returns an into (1-100 range)
+int roll1000(); //returns an into (1-100 range)
 void incrementSimClockAfterMessageReceipt(int);
 void spawnNewUser();
+void terminateUser(int);
+int getNextOccupiedQueue();
+
+void initQueue(int[], int);
+int getNextProcFromQueue(int[]); //array name, returns proc_num of next process in queue, -1 if queue is empty
+int addProcToQueue(int[], int, int); //array name, arrsize, proc_num, returns 1 if successful, else -1
+int removeProcFromQueue(int[], int, int); //array name, arrsize, proc_num, returns 1 if successful, else -1
 
 /************************* Global variables ***********************************/
 
@@ -55,10 +62,12 @@ int shmid_pct; //shared memory id holder for process control table
 int oss_qid; //message queue ID for OSS communications
 static unsigned int *simClock_secs; //pointer to shm sim clock (seconds)
 static unsigned int *simClock_ns; //pointer to shm sim clock (nanoseconds)
+int arraysize = 19; //so I can use local sim pids 1-18 without confusion
 int queue0[19]; //Round Robin queue for realtime processes
 int queue1[19]; //high-priority queue
 int queue2[19]; //medium-priority queue
 int queue3[19]; //low-priority queue
+int nextProcToRun, nextOccupiedQueue;
 unsigned int maxTimeBetweenProcsNS, maxTimeBetweenProcsSecs;
 unsigned int timeToNextProcNS, timeToNextProcSecs, seed;
 unsigned int spawnNextProcNS, spawnNextProcSecs;
@@ -78,6 +87,7 @@ struct pcb { // Process control block struct
     unsigned int blockedUntilNS;
     int localPID;
     int isRealTimeClass; // 1 = realtime class process
+    int currentQueue;
 };
 
 //struct for communications message queue
@@ -95,14 +105,14 @@ struct commsbuf infostruct;
 struct pcb * pct; //pct = process control table (array of 18 process
                   //control blocks)
 
-/**************************** MAIN ********************************************/
+/************************************ MAIN ************************************/
 
 int main(int argc, char** argv) {
+    int i; //the great iterator
     maxTimeBetweenProcsNS = 999999998;
-    maxTimeBetweenProcsSecs = 1;
+    maxTimeBetweenProcsSecs = 0;
     seed = (unsigned int) getpid(); //use my pid as first rand seed
     double runtime = 10; // Seconds before timeout interrupt & termination
-    int arraysize = 18 + 1; //so I can use local sim pids 1-18 without confusion
     pid_t childpid; //holder for childpid, used when determining child fork
     char str_pct_id[20]; //string argument sent to users, holds shmid for pct
     char str_user_sim_pid[4]; // string arg for user's simulated pid (1-18)
@@ -129,56 +139,66 @@ int main(int argc, char** argv) {
     initQueue(queue2, arraysize);
     initQueue(queue3, arraysize);
     
+    //schedule a time for the first process to spawn
     setTimeToNextProc();
     printf("First user will spawn at %u:%u\n", 
     spawnNextProcSecs, spawnNextProcNS);
     
-    //go ahead and increment sim clock to spawn first user (no mutex needed)
-    *simClock_secs = spawnNextProcSecs;
-    *simClock_ns = spawnNextProcNS;
-    
-    setTimeToNextProc();
-    
-    //******************** TEMP TESTING CODE******************************************************************************
-    makePCB(1, 1); //pid1, realtime = yes
-    infostruct.msgtyp = 1;
-    infostruct.ossTimeSliceGivenNS = quantum_0;
-    infostruct.userTerminatingFlag = 0;
-    infostruct.userUsedFullTimeSliceFlag = 0;
-    infostruct.user_sim_pid = 1;
-    if ( (childpid = fork()) < 0 ){ //terminate code
-                perror("OSS: Error forking user");
-                return 0;
-            }
-    if (childpid == 0) { //child code
-        printf("OSS: execcing child\n");
-        sprintf(str_pct_id, "%d", shmid_pct); //build arg1 string
-        sprintf(str_user_sim_pid, "%d", infostruct.user_sim_pid);
-        execlp("./user", "./user", str_pct_id, str_user_sim_pid, (char *)NULL);
-        perror("OSS: execl() failure"); //report & exit if exec fails
-        return 0;
-    }
-    childpids[1] = childpid;
-    printf("OSS: Sending FIRST message to user.\n");
-        infostruct.msgtyp = (long)infostruct.user_sim_pid;
-        if ( msgsnd(oss_qid, &infostruct, sizeof(infostruct), 0) == -1 ) {
-            perror("OSS: error sending init msg");
-            clearIPC();
-            exit(0);
-        }
-    //******************** TEMP TESTING CODE******************************************************************************
-    
+    /********************* SCHEDULING ALGORITHM *******************************/
     while (1) {
-        //wait for a message from user (Always msgtyp 99)
+        //get highest priority occupied queue number
+        nextOccupiedQueue = getNextOccupiedQueue();
+        //if all queues are empty, advance system clock to next spawn time,
+        //spawn a user, and send schedule it
+        if (nextOccupiedQueue == -1) {
+            *simClock_secs = spawnNextProcSecs;
+            *simClock_ns = spawnNextProcNS;
+            spawnNewUser(); //also sets new time for next proc spawn and
+                            //packs proper info into infostruct
+            if ( msgsnd(oss_qid, &infostruct, sizeof(infostruct), 0) == -1 ) {
+                perror("OSS: error sending init msg");
+                clearIPC();
+                exit(0);
+            }
+        }
+        //wait for a message from any user (Always msgtyp 99)
         if ( msgrcv(oss_qid, &infostruct, sizeof(infostruct), 99, 0) == -1 ) {
             perror("User: error in msgrcv");
             clearIPC();
             exit(0);
         }
-        pct[infostruct.user_sim_pid].timeUsedLastBurst_ns = infostruct.userTimeUsedLastBurst;
+        //store CPU time used in appropriate process control block
+        pct[infostruct.user_sim_pid].timeUsedLastBurst_ns = 
+                infostruct.userTimeUsedLastBurst;
+        //increment the sim clock accordingly
         incrementSimClockAfterMessageReceipt(infostruct.user_sim_pid);
+        
         printf("OSS: Message received from user %d, ran %u, clock now %ld:%ld\n", 
-                infostruct.user_sim_pid, infostruct.userTimeUsedLastBurst, *simClock_secs, *simClock_ns);
+                infostruct.user_sim_pid, infostruct.userTimeUsedLastBurst, 
+                *simClock_secs, *simClock_ns);
+        
+        //store & clear info, and remove from queue, if user reports termination
+        if (infostruct.userTerminatingFlag == 1) {
+            printf("OSS: User reported termination!\n");
+            sleep(1);
+            terminateUser(infostruct.user_sim_pid);
+        }
+        //if full time slice was used
+        else if (infostruct.userUsedFullTimeSliceFlag == 1) {
+            //if in queue1, move down to queue2
+            if (pct[infostruct.user_sim_pid].currentQueue == 1) {
+                removeProcFromQueue(queue1, arraysize, infostruct.user_sim_pid);
+                addProcToQueue(queue2, arraysize, infostruct.user_sim_pid);
+                pct[infostruct.user_sim_pid].currentQueue = 2;
+            }
+            //if in queue2, move down to queue3
+            else if (pct[infostruct.user_sim_pid].currentQueue == 2) {
+                removeProcFromQueue(queue2, arraysize, infostruct.user_sim_pid);
+                addProcToQueue(queue3, arraysize, infostruct.user_sim_pid);
+                pct[infostruct.user_sim_pid].currentQueue = 3;
+            }
+        }
+        
         //spawn a user process if it's time AND there's an open spot
         if (isTimeToSpawnProc() && (getOpenBitVector() != -1) ) {
             spawnNewUser();
@@ -187,14 +207,69 @@ int main(int argc, char** argv) {
         else if (isTimeToSpawnProc() && (getOpenBitVector() == -1) ) {
             setTimeToNextProc();
         }
-        
-        infostruct.msgtyp = 1;
-        if ( msgsnd(oss_qid, &infostruct, sizeof(infostruct), 0) == -1 ) {
-            perror("OSS: error sending init msg");
-            clearIPC();
-            exit(0);
+        //obtain highest priority occupied queue, get pid of first process
+        //in that queue, attach appropriate time quantum, and move the
+        //process to the back of the queue it's in
+        nextOccupiedQueue = getNextOccupiedQueue();
+        if (nextOccupiedQueue == 0) {
+            nextProcToRun = getNextProcFromQueue(queue0);
+            infostruct.ossTimeSliceGivenNS = quantum_0;
+            removeProcFromQueue(queue0, arraysize, nextProcToRun);
+            addProcToQueue(queue0, arraysize, nextProcToRun);
         }
+        else if (nextOccupiedQueue == 1) {
+            nextProcToRun = getNextProcFromQueue(queue1);
+            infostruct.ossTimeSliceGivenNS = quantum_1;
+            removeProcFromQueue(queue1, arraysize, nextProcToRun);
+            addProcToQueue(queue1, arraysize, nextProcToRun);
+        }
+        else if (nextOccupiedQueue == 2) {
+            nextProcToRun = getNextProcFromQueue(queue2);
+            infostruct.ossTimeSliceGivenNS = quantum_2;
+            removeProcFromQueue(queue2, arraysize, nextProcToRun);
+            addProcToQueue(queue2, arraysize, nextProcToRun);
+        }
+        else if (nextOccupiedQueue == 3) {
+            nextProcToRun = getNextProcFromQueue(queue3);
+            infostruct.ossTimeSliceGivenNS = quantum_3;
+            removeProcFromQueue(queue3, arraysize, nextProcToRun);
+            addProcToQueue(queue3, arraysize, nextProcToRun);
+        }
+        else {
+            printf("OSS: No processes in queue\n");
+            continue;
+        }
+        if (nextProcToRun != -1) {
+            infostruct.msgtyp = (long) nextProcToRun;
+            infostruct.userTerminatingFlag = 0;
+            infostruct.userUsedFullTimeSliceFlag = 0;
+            infostruct.user_sim_pid = nextProcToRun;
+            printf("OSS: Scheduling user %d now\n", nextProcToRun);
+            if ( msgsnd(oss_qid, &infostruct, sizeof(infostruct), 0) == -1 ) {
+                perror("OSS: error sending init msg");
+                clearIPC();
+                exit(0);
+            }
+        }
+        else printf("OSS: no processes in queue\n");
         
+        printf("Q0:");
+        for (i=1; i<arraysize; i++) {
+            printf("%d.", queue0[i]);
+        }
+        printf(" Q1:");
+        for (i=1; i<arraysize; i++) {
+            printf("%d.", queue1[i]);
+        }
+        printf(" Q2:");
+        for (i=1; i<arraysize; i++) {
+            printf("%d.", queue2[i]);
+        }
+        printf(" Q3:");
+        for (i=1; i<arraysize; i++) {
+            printf("%d.", queue3[i]);
+        }
+        printf("\n");
     
     }
     
@@ -208,29 +283,111 @@ int main(int argc, char** argv) {
 
 /*************************** FUNCTIONS ****************************************/
 
+void terminateUser(int termpid) {
+    if (pct[termpid].currentQueue == 0) {
+        removeProcFromQueue(queue0, arraysize, termpid);
+    }
+    else if (pct[termpid].currentQueue == 1) {
+        removeProcFromQueue(queue1, arraysize, termpid);
+    }
+    else if (pct[termpid].currentQueue == 2) {
+        removeProcFromQueue(queue2, arraysize, termpid);
+    }
+    else if (pct[termpid].currentQueue == 3) {
+        removeProcFromQueue(queue3, arraysize, termpid);
+    }
+    bitVector[termpid] = 0;
+}
+
+int getNextOccupiedQueue() {
+    if (queue0[1] != 0) {
+        return 0;
+    }
+    else if (queue1[1] != 0) {
+        return 1;
+    }
+    else if (queue2[1] != 0) {
+        return 2;
+    }
+    else if (queue3[1] != 0) {
+        return 3;
+    }
+    else return -1;
+}
+
+int addProcToQueue (int q[], int arrsize, int proc_num) {
+    int i;
+    for (i=1; i<arrsize; i++) {
+        if (q[i] == 0) { //empty queue spot found
+            q[i] = proc_num;
+            //do something with pct
+            return 1;
+        }
+    }
+    return -1; //no empty spot found
+}
+
+int removeProcFromQueue(int q[], int arrsize, int proc_num) {
+    //do something with pct
+    int i;
+    for (i=1; i<arrsize; i++) {
+        if (q[i] == proc_num) { //found the process to remove from queue
+            while(i+1 < arrsize) { //shift next in queue down 1, repeat
+                q[i] = q[i+1];
+                i++;
+            }
+            q[18] = 0; //once 18 is moved to 17, clear it up by setting to 0
+            return 1;
+        }
+    }
+    return -1;
+}
+
+int getNextProcFromQueue(int q[]) {
+    if (q[1] == 0) { //queue is empty
+        return -1;
+    }
+    else return q[1];
+}
+
+//also sets time for next process
 void spawnNewUser() {
     char str_pct_id[20]; //string argument sent to users, holds shmid for pct
     char str_user_sim_pid[4]; // string arg for user's simulated pid (1-18)
     int user_sim_pid;
     pid_t childpid;
-    setTimeToNextProc();
+    setTimeToNextProc(); //decide when the next user process will be spawned
     user_sim_pid = getOpenBitVector();
+    if (user_sim_pid == -1) {
+        printf("OSS: Error in spawnNewUser: no open bitvector\n");
+        clearIPC();
+        exit(0);
+    }
     infostruct.msgtyp = user_sim_pid;
-    infostruct.ossTimeSliceGivenNS = quantum_0;
     infostruct.userTerminatingFlag = 0;
     infostruct.userUsedFullTimeSliceFlag = 0;
     infostruct.user_sim_pid = user_sim_pid;
-    makePCB (user_sim_pid, 1);
+    // 10% chance it's a real-time process
+    if (roll1000() < 10) {
+        infostruct.ossTimeSliceGivenNS = quantum_0;
+        makePCB(user_sim_pid, 1);
+        addProcToQueue(queue0, arraysize, user_sim_pid);
+    }
+    else {
+        infostruct.ossTimeSliceGivenNS = quantum_0;
+        makePCB(user_sim_pid, 0);
+        addProcToQueue(queue1, arraysize, user_sim_pid);
+    }
     if ( (childpid = fork()) < 0 ){ //terminate code
         perror("OSS: Error forking user");
-        return 0;
+        exit(0);
     }
     if (childpid == 0) { //child code
         sprintf(str_pct_id, "%d", shmid_pct); //build arg1 string
         sprintf(str_user_sim_pid, "%d", user_sim_pid);
         execlp("./user", "./user", str_pct_id, str_user_sim_pid, (char *)NULL);
         perror("OSS: execl() failure"); //report & exit if exec fails
-        return 0;
+        exit(0);
     }
     childpids[user_sim_pid] = childpid;
 }
@@ -243,7 +400,7 @@ void incrementSimClockAfterMessageReceipt(int userpid) {
     //increment last user burst
     localns = localns + pct[userpid].timeUsedLastBurst_ns;
     
-    if (localns >= BILLION) { //roll ns to s if > bill ********************************************
+    if (localns >= BILLION) {
         localsec++;
         temp = localns - BILLION;
         localns = temp;
@@ -252,8 +409,9 @@ void incrementSimClockAfterMessageReceipt(int userpid) {
     *simClock_secs = localsec;
     *simClock_ns = localns;
 }
+
 //sets length of sim time from now until next child process spawn
-//AND sets variables to indicate when that time will be on the sim clock****************************
+//AND sets variables to indicate when that time will be on the sim clock
 void setTimeToNextProc() {
     unsigned int temp;
     unsigned int localsecs = *simClock_secs;
@@ -271,9 +429,9 @@ void setTimeToNextProc() {
     printf("OSS SET NEXT PROC FUNCTION: Next user will spawn at %ld:%ld\n", spawnNextProcSecs, spawnNextProcNS );
 }
 
-int roll100() {
+int roll1000() {
     int return_val;
-    return_val = rand_r(&seed) % (100 + 1);
+    return_val = rand_r(&seed) % (1000 + 1);
     return return_val;
 }
 
@@ -285,7 +443,7 @@ int isTimeToSpawnProc() {
             ( (localsec >= spawnNextProcSecs) && (localns >= spawnNextProcNS) ) ) {
         return_val = 1;
     }
-    printf("OSS SPAWN CHECK FUNCTION: time: %ld:%ld next: %ld:%ld isTimeToSpawnProc = %d\n", localsec, localns, spawnNextProcSecs, spawnNextProcNS, return_val);
+    //printf("OSS SPAWN CHECK FUNCTION: time: %ld:%ld next: %ld:%ld isTimeToSpawnProc = %d\n", localsec, localns, spawnNextProcSecs, spawnNextProcNS, return_val);
     return return_val;
 }
 
@@ -315,6 +473,13 @@ void makePCB(int pidnum, int isRealTime) {
     pct[pidnum].blockedUntilNS = 0;
     pct[pidnum].localPID = pidnum; //pids will be 1-18
     pct[pidnum].isRealTimeClass = isRealTime;
+    //place into round-robin queue if realtime, else queue1
+    if (isRealTime == 1) {
+        pct[pidnum].currentQueue = 0;
+    }
+    else {
+        pct[pidnum].currentQueue = 1;
+    }
     bitVector[pidnum] = 1; //mark this pcb taken in bit vector
     printf("OSS: Generated process id %d, isRealTime = %d\n", 
         pct[pidnum].localPID, pct[pidnum].isRealTimeClass);

@@ -25,7 +25,7 @@
 /****************************FUNCTION PROTOTYPES *****************************/
 void getIPC(); //Attach shared memory (allocated by OSS) to local vars
 static void siginthandler(int); //SIGINT handler
-int roll100(); //returns an int in range 1-100
+int roll1000(); //returns an int in range 1-100
 void reportFinishedTimeSlice();
 void reportTermination();
 void reportInterrupt();
@@ -52,6 +52,7 @@ struct pcb { // Process control block struct
     unsigned int blockedUntilNS;
     int localPID;
     int isRealTimeClass; // 1 = realtime class process
+    int currentQueue;
 };
 
 struct pcb * pct; //pct = process control table (array of process
@@ -83,20 +84,27 @@ int main(int argc, char** argv) {
     myStartTimeSecs = *simClock_secs; 
     myStartTimeNS = *simClock_ns;
     
+    /*********************USER OPERATIONS ALGORITHM ***************************/
     while(1) {
-        if ( msgrcv(oss_qid, &myinfo, sizeof(myinfo), 1, my_sim_pid) == -1 ) {
+        if ( msgrcv(oss_qid, &myinfo, sizeof(myinfo), my_sim_pid, 0) == -1 ) {
             perror("User: error in msgrcv");
             exit(0);
         }
+        printf("User %d recieved msgtyp %ld\n", my_sim_pid, myinfo.msgtyp);
         
-        if (roll100() <= 10) {
+        //roll to terminate
+        if (roll1000() < 7) {
             printf("user %d rolled to terminate!\n", myinfo.user_sim_pid);
-            sleep(1);
+            reportTermination();
+            exit(1);
+        }
+        //roll to get blocked
+        if (0) {
+            
+        }
+        else {
             reportFinishedTimeSlice();
         }
-    
-        
-        //sleep(1);
 
     }
     
@@ -105,19 +113,24 @@ int main(int argc, char** argv) {
     return (EXIT_SUCCESS);
 }
 
+/************************************* FUNCTIONS ******************************/
+
+//packs appropriate information into struct and sends vis message queue
+//if this user has finished all of its given timeslice for this burst
 void reportFinishedTimeSlice() {
     myinfo.userTerminatingFlag = 0;
     myinfo.userUsedFullTimeSliceFlag = 1;
     myinfo.userTimeUsedLastBurst = myinfo.ossTimeSliceGivenNS;
     myinfo.user_sim_pid = my_sim_pid;
     myinfo.msgtyp = 99;
-    
     if ( msgsnd(oss_qid, &myinfo, sizeof(myinfo), 0) == -1 ) {
         perror("User: error sending msg to oss");
         exit(0);
     }
 }
 
+//packs appropriate information into struct and sends vis message queue
+//if this user has rolled to terminate during this given timeslice
 void reportTermination() {
     myinfo.userTerminatingFlag = 1;
     myinfo.userUsedFullTimeSliceFlag = 0;
@@ -131,19 +144,22 @@ void reportTermination() {
     }
 }
 
+//returns time in nanoseconds of a random portion of the given timeslice
 unsigned int randomPortionOfTimeSlice() {
     unsigned int return_val;
     return_val = rand_r(&seed) % (myinfo.ossTimeSliceGivenNS + 1);
     return return_val;
 }
 
+
 void reportInterrupt() {
     
 }
 
-int roll100() {
+//rolls and returns an int from 1-1000
+int roll1000() {
     int return_val;
-    return_val = rand_r(&seed) % (100 + 1);
+    return_val = rand_r(&seed) % (1000 + 1);
     return return_val;
 }
 
