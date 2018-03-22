@@ -29,6 +29,7 @@ int roll1000(); //returns an int in range 1-100
 void reportFinishedTimeSlice();
 void reportTermination();
 void reportBlocked();
+void reportPreempted();
 unsigned int randomPortionOfTimeSlice();
 
 /***************************** GLOBALS ***************************************/
@@ -62,6 +63,7 @@ struct pcb * pct; //pct = process control table (array of process
 struct commsbuf {
     long msgtyp;
     int user_sim_pid;
+    pid_t user_sys_pid;
     unsigned int ossTimeSliceGivenNS; //from oss. time slice given to run
     int userTerminatingFlag; //from user. 1=terminating, 0=not terminating
     int userUsedFullTimeSliceFlag; //fromuser. 1=used full time slice
@@ -74,12 +76,15 @@ struct commsbuf myinfo;
 /********************************* MAIN **************************************/
 int main(int argc, char** argv) {
     unsigned int localsec, localns;
+    myinfo.user_sys_pid = getpid();
     shmid_pct = atoi(argv[1]);
     my_sim_pid = atoi(argv[2]);
-    printf("User my_sim_pid %d spawned.\n", my_sim_pid);
+    int roll;
     
     // Set up interrupt handler
     signal (SIGINT, siginthandler);
+    
+    printf("User %d launched.\n", my_sim_pid);
     
     //get IPC info and read clock for my start time
     getIPC();
@@ -89,30 +94,34 @@ int main(int argc, char** argv) {
     /*********************USER OPERATIONS ALGORITHM ***************************/
     while(1) {
         if ( msgrcv(oss_qid, &myinfo, sizeof(myinfo), my_sim_pid, 0) == -1 ) {
-            perror("User: error in msgrcv");
+            //perror("User: error in msgrcv");
+            printf("User %02d Terminated: Interrupted\n", my_sim_pid);
             exit(0);
         }
-        //printf("User %d recieved msgtyp %ld\n", my_sim_pid, myinfo.msgtyp);
+        myinfo.user_sys_pid = getpid();
         
         //roll to terminate
-        if (roll1000() < 10) {
-            //printf("user %d rolled to terminate!\n", myinfo.user_sim_pid);
+        roll = roll1000();
+        if (roll < 15) {
             //roll a portion of timeslice to use before terminating
             myinfo.userTimeUsedLastBurst = randomPortionOfTimeSlice();
             reportTermination();
-            exit(1);
+            printf("User %d rolled to terminate.\n", my_sim_pid);
+            return 1;
         }
         //roll to get blocked
-        else if (roll1000() < 10) {
+        else if (roll < 24) {
             //read sim clock
             localsec = *simClock_secs; 
             localns = *simClock_ns;
             //set a time 0-5:0-1000 to be unblocked in process control block
             pct[my_sim_pid].blockedUntilSecs = localsec + (rand_r(&seed) % 5 + 1);
             pct[my_sim_pid].blockedUntilNS = localns + (rand_r(&seed) % 1000 + 1);
-            //printf("user %d rolled to GET BLOCKED until %ld:%09ld\n", myinfo.user_sim_pid,
-                    //pct[my_sim_pid].blockedUntilSecs, pct[my_sim_pid].blockedUntilNS);
             reportBlocked();
+        }
+        //roll to get preempted
+        else if (roll < 250) {
+            reportPreempted();
         }
         else {
             reportFinishedTimeSlice();
@@ -134,6 +143,19 @@ void reportFinishedTimeSlice() {
     myinfo.userTerminatingFlag = 0;
     myinfo.userUsedFullTimeSliceFlag = 1;
     myinfo.userTimeUsedLastBurst = myinfo.ossTimeSliceGivenNS;
+    myinfo.user_sim_pid = my_sim_pid;
+    myinfo.msgtyp = 99;
+    if ( msgsnd(oss_qid, &myinfo, sizeof(myinfo), 0) == -1 ) {
+        perror("User: error sending msg to oss");
+        exit(0);
+    }
+}
+
+void reportPreempted() {
+    myinfo.userBlockedFlag = 0;
+    myinfo.userTerminatingFlag = 0;
+    myinfo.userUsedFullTimeSliceFlag = 0;
+    myinfo.userTimeUsedLastBurst = randomPortionOfTimeSlice();
     myinfo.user_sim_pid = my_sim_pid;
     myinfo.msgtyp = 99;
     if ( msgsnd(oss_qid, &myinfo, sizeof(myinfo), 0) == -1 ) {
@@ -180,7 +202,7 @@ void reportBlocked() {
 //rolls and returns an int from 1-1000
 int roll1000() {
     int return_val;
-    return_val = rand_r(&seed) % (1000 + 1);
+    return_val = rand_r(&seed) % 1000 + 1;
     return return_val;
 }
 
