@@ -46,9 +46,15 @@ int roll1000(); //returns an into (1-100 range)
 void incrementSimClockAfterMessageReceipt(int);
 void spawnNewUser();
 void terminateUser(int);
-int getNextOccupiedQueue();
+void blockUser(int);
+void checkBlockedQueue();
+void awakenUser(int);
+int isBlockedQueueEmpty();
+
+void printarrays();
 
 void initQueue(int[], int);
+int getNextOccupiedQueue();
 int getNextProcFromQueue(int[]); //array name, returns proc_num of next process in queue, -1 if queue is empty
 int addProcToQueue(int[], int, int); //array name, arrsize, proc_num, returns 1 if successful, else -1
 int removeProcFromQueue(int[], int, int); //array name, arrsize, proc_num, returns 1 if successful, else -1
@@ -67,6 +73,8 @@ int queue0[19]; //Round Robin queue for realtime processes
 int queue1[19]; //high-priority queue
 int queue2[19]; //medium-priority queue
 int queue3[19]; //low-priority queue
+
+int blocked[19]; //blocked queue
 int nextProcToRun, nextOccupiedQueue;
 unsigned int maxTimeBetweenProcsNS, maxTimeBetweenProcsSecs;
 unsigned int timeToNextProcNS, timeToNextProcSecs, seed;
@@ -97,6 +105,7 @@ struct commsbuf {
     unsigned int ossTimeSliceGivenNS; //from oss. time slice given to run
     int userTerminatingFlag; //from user. 1=terminating, 0=not terminating
     int userUsedFullTimeSliceFlag; //from user. 1=used full time slice
+    int userBlockedFlag; //from user. 1=blocked
     unsigned int userTimeUsedLastBurst; //from user, time in ns that it ran
 };
 
@@ -117,6 +126,7 @@ int main(int argc, char** argv) {
     char str_pct_id[20]; //string argument sent to users, holds shmid for pct
     char str_user_sim_pid[4]; // string arg for user's simulated pid (1-18)
     int user_sim_pid;
+    int firstblocked;
     
     // Set up ctrl^c interrupt handling
     signal (SIGINT, siginthandler);
@@ -138,6 +148,7 @@ int main(int argc, char** argv) {
     initQueue(queue1, arraysize);
     initQueue(queue2, arraysize);
     initQueue(queue3, arraysize);
+    initQueue(blocked, arraysize);
     
     //schedule a time for the first process to spawn
     setTimeToNextProc();
@@ -146,11 +157,20 @@ int main(int argc, char** argv) {
     
     /********************* SCHEDULING ALGORITHM *******************************/
     while (1) {
+        //if any users are blocked, parse the queue and awaken 
+        //users if their time has come
+        printf("before checking blocked queue in oss algo:\n");
+        printarrays();
+        if (isBlockedQueueEmpty() == 0) {
+            checkBlockedQueue();
+        }
+        printf("after checking blocked queues, back in oss algo:\n");
+        printarrays();
         //get highest priority occupied queue number
         nextOccupiedQueue = getNextOccupiedQueue();
         //if all queues are empty, advance system clock to next spawn time,
-        //spawn a user, and send schedule it
-        if (nextOccupiedQueue == -1) {
+        //spawn a user, and schedule it
+        if ( nextOccupiedQueue == -1 ) {
             *simClock_secs = spawnNextProcSecs;
             *simClock_ns = spawnNextProcNS;
             spawnNewUser(); //also sets new time for next proc spawn and
@@ -161,19 +181,26 @@ int main(int argc, char** argv) {
                 exit(0);
             }
         }
+        printf("before receiving next user message:\n");
+        printarrays();
+        firstblocked = blocked[1]; //***************************************************************************** get weird
+        
         //wait for a message from any user (Always msgtyp 99)
         if ( msgrcv(oss_qid, &infostruct, sizeof(infostruct), 99, 0) == -1 ) {
             perror("User: error in msgrcv");
             clearIPC();
             exit(0);
         }
+        blocked[1] = firstblocked; //***************************************************************************** get weird
+        printf("immediately after receiving that user message:\n"); //************************************************************************PROBLEM HERE
+        printarrays();
         //store CPU time used in appropriate process control block
         pct[infostruct.user_sim_pid].timeUsedLastBurst_ns = 
                 infostruct.userTimeUsedLastBurst;
         //increment the sim clock accordingly
         incrementSimClockAfterMessageReceipt(infostruct.user_sim_pid);
         
-        printf("OSS: Message received from user %d, ran %u, clock now %ld:%ld\n", 
+        printf("OSS: Message received from user %d, ran %u, clock now %u:%09u\n", 
                 infostruct.user_sim_pid, infostruct.userTimeUsedLastBurst, 
                 *simClock_secs, *simClock_ns);
         
@@ -182,6 +209,12 @@ int main(int argc, char** argv) {
             printf("OSS: User reported termination!\n");
             sleep(1);
             terminateUser(infostruct.user_sim_pid);
+        }
+        //if the user was blocked on some event
+        else if (infostruct.userBlockedFlag == 1) {
+            printf("OSS: User %d reported BLOCKED!\n", infostruct.user_sim_pid);
+            sleep(1);
+            blockUser(infostruct.user_sim_pid);
         }
         //if full time slice was used
         else if (infostruct.userUsedFullTimeSliceFlag == 1) {
@@ -243,6 +276,7 @@ int main(int argc, char** argv) {
             infostruct.msgtyp = (long) nextProcToRun;
             infostruct.userTerminatingFlag = 0;
             infostruct.userUsedFullTimeSliceFlag = 0;
+            infostruct.userBlockedFlag = 0;
             infostruct.user_sim_pid = nextProcToRun;
             printf("OSS: Scheduling user %d now\n", nextProcToRun);
             if ( msgsnd(oss_qid, &infostruct, sizeof(infostruct), 0) == -1 ) {
@@ -253,23 +287,6 @@ int main(int argc, char** argv) {
         }
         else printf("OSS: no processes in queue\n");
         
-        printf("Q0:");
-        for (i=1; i<arraysize; i++) {
-            printf("%d.", queue0[i]);
-        }
-        printf(" Q1:");
-        for (i=1; i<arraysize; i++) {
-            printf("%d.", queue1[i]);
-        }
-        printf(" Q2:");
-        for (i=1; i<arraysize; i++) {
-            printf("%d.", queue2[i]);
-        }
-        printf(" Q3:");
-        for (i=1; i<arraysize; i++) {
-            printf("%d.", queue3[i]);
-        }
-        printf("\n");
     
     }
     
@@ -282,6 +299,77 @@ int main(int argc, char** argv) {
 /*************************** END MAIN *****************************************/
 
 /*************************** FUNCTIONS ****************************************/
+
+int isBlockedQueueEmpty() {
+    if (blocked[1] != 0) {
+        return 0;
+    }
+    return 1;
+}
+
+//compares sim clock with "blocked-until" times of each occupied
+//slot in the blocked queue and wakes them up if it's time
+void checkBlockedQueue() {
+    int j;
+    //read current simclock
+    unsigned int localsec = *simClock_secs;
+    unsigned int localns = *simClock_ns;
+    //for each slot in the blocked queue
+    for (j=1; j<arraysize; j++) {
+        //if the blocked array slot is occupied by a process
+        if (blocked[j] != 0) {
+            //and if the time has passed for it to be awoken
+            if ( (localsec > pct[blocked[j]].blockedUntilSecs) || 
+            ( (localsec >= pct[blocked[j]].blockedUntilSecs) && 
+                    (localns >= pct[blocked[j]].blockedUntilNS) ) ) {
+                //then AWAKEN HIIIIIIIIIIM!!!!
+                //printf("OSS: Calling awakenUser(%d) ... ", blocked[j]);
+                awakenUser(blocked[j]);
+            }
+        }
+    }
+}
+
+void awakenUser(int wakepid) {
+    printf("OSS: AWAKENING USER %d. arrays:\n", wakepid);
+    printarrays();
+    sleep(1);
+    //remove this user from the blocked queue
+    removeProcFromQueue(blocked, arraysize, wakepid);
+    printf("after removeProcFromQueue:\n");
+    printarrays();
+    //update the process control block
+    pct[wakepid].blocked = 0;
+    pct[wakepid].blockedUntilNS = 0;
+    pct[wakepid].blockedUntilSecs = 0;  //*****************************************************weird
+    //if it's realtime, put it back in realitime queue
+    if (pct[wakepid].isRealTimeClass == 1) {
+        addProcToQueue(queue0, arraysize, wakepid);
+        pct[wakepid].currentQueue = 0;
+    }
+    //otherwise add it back into queue 1 (high-priority)
+    else {
+        addProcToQueue(queue1, arraysize, wakepid);
+        pct[wakepid].currentQueue = 1;
+    }
+    printf("after addProcToQueue:\n");
+    printarrays();
+}
+
+void blockUser(int blockpid) {
+    //remove from current queue
+    pct[blockpid].blocked = 1;
+    if (pct[blockpid].currentQueue == 0)
+        {removeProcFromQueue(queue0, arraysize, blockpid);}
+    else if (pct[blockpid].currentQueue == 1)
+        {removeProcFromQueue(queue1, arraysize, blockpid);}
+    else if (pct[blockpid].currentQueue == 2)
+        {removeProcFromQueue(queue2, arraysize, blockpid);}
+    else if (pct[blockpid].currentQueue == 3)
+        {removeProcFromQueue(queue3, arraysize, blockpid);}
+    //and add it to the blocked queue
+    addProcToQueue(blocked, arraysize, blockpid);
+}
 
 void terminateUser(int termpid) {
     if (pct[termpid].currentQueue == 0) {
@@ -320,7 +408,6 @@ int addProcToQueue (int q[], int arrsize, int proc_num) {
     for (i=1; i<arrsize; i++) {
         if (q[i] == 0) { //empty queue spot found
             q[i] = proc_num;
-            //do something with pct
             return 1;
         }
     }
@@ -367,16 +454,18 @@ void spawnNewUser() {
     infostruct.userTerminatingFlag = 0;
     infostruct.userUsedFullTimeSliceFlag = 0;
     infostruct.user_sim_pid = user_sim_pid;
-    // 10% chance it's a real-time process
+    //chance it's a real-time process
     if (roll1000() < 10) {
         infostruct.ossTimeSliceGivenNS = quantum_0;
         makePCB(user_sim_pid, 1);
         addProcToQueue(queue0, arraysize, user_sim_pid);
+        pct[user_sim_pid].currentQueue = 0;
     }
     else {
-        infostruct.ossTimeSliceGivenNS = quantum_0;
+        infostruct.ossTimeSliceGivenNS = quantum_1;
         makePCB(user_sim_pid, 0);
         addProcToQueue(queue1, arraysize, user_sim_pid);
+        pct[user_sim_pid].currentQueue = 1;
     }
     if ( (childpid = fork()) < 0 ){ //terminate code
         perror("OSS: Error forking user");
@@ -396,7 +485,11 @@ void incrementSimClockAfterMessageReceipt(int userpid) {
     unsigned int localsec = *simClock_secs;
     unsigned int localns = *simClock_ns;
     unsigned int temp;
-    localns = localns + 100; //increment 100ns for oss operations
+    temp = roll1000();
+    if (temp < 100) temp = 100;
+    else temp = temp * 10;
+    localns = localns + temp; //increment 100-10,000ns for oss operations
+    printf("OSS: Time spent this dispatch: %ld nanoseconds\n", temp);
     //increment last user burst
     localns = localns + pct[userpid].timeUsedLastBurst_ns;
     
@@ -405,7 +498,7 @@ void incrementSimClockAfterMessageReceipt(int userpid) {
         temp = localns - BILLION;
         localns = temp;
     }
-    
+    //update the sim clock in shared memory
     *simClock_secs = localsec;
     *simClock_ns = localns;
 }
@@ -426,7 +519,7 @@ void setTimeToNextProc() {
         spawnNextProcNS = temp;
     }
     
-    printf("OSS SET NEXT PROC FUNCTION: Next user will spawn at %ld:%ld\n", spawnNextProcSecs, spawnNextProcNS );
+    printf("OSS SET NEXT PROC FUNCTION: Next user will spawn at %ld:%09ld\n", spawnNextProcSecs, spawnNextProcNS );
 }
 
 int roll1000() {
@@ -557,6 +650,32 @@ void initQueue(int q[], int size) {
     for(i=0; i<size; i++) {
         q[i] = 0;
     }
+}
+
+void printarrays() {
+    //printing shit for testing
+    int i;
+        printf("Q0-");
+        for (i=1; i<arraysize; i++) {
+            printf("%d.", queue0[i]);
+        }
+        printf(" Q1-");
+        for (i=1; i<arraysize; i++) {
+            printf("%d.", queue1[i]);
+        }
+        printf(" Q2-");
+        for (i=1; i<arraysize; i++) {
+            printf("%d.", queue2[i]);
+        }
+        printf(" Q3-");
+        for (i=1; i<arraysize; i++) {
+            printf("%d.", queue3[i]);
+        }
+        printf(" BL-");
+        for (i=1; i<arraysize; i++) {
+            printf("%d.", blocked[i]);
+        }
+        printf("\n");
 }
 
 /********************* INTERRUPT HANDLING *************************************/
