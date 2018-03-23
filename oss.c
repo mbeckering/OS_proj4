@@ -36,9 +36,6 @@ void initBitVector(int); //initilize bit vector
 void allocateIPC(); //allocate shared memory
 void clearIPC(); //clear shared memory and message queues
 void initQueue(int[], int); //initialize queues, takes queue name and size
-static int setperiodic(double); //timed interrupt handler
-static int setinterrupt(); //SIGALRM handler
-static void interrupt(int signo, siginfo_t *info, void *context); //actions
 static void siginthandler(int sig_num); //SIGINT handler
 void setTimeToNextProc(); //rolls AND stores sim clock time for next user exec
 int isTimeToSpawnProc(); //checks to see if it's time to spawn another process
@@ -128,30 +125,21 @@ struct pcb * pct; //pct = process control table (array of 18 process
 
 int main(int argc, char** argv) {
     int i; //the great iterator
+    double realTimeElapsed = 0;
+    double runtimeAllowed = 3; // Seconds before timeout interrupt & termination
     maxTimeBetweenProcsNS = 999999998;
     maxTimeBetweenProcsSecs = 0;
     seed = (unsigned int) getpid(); //use my pid as first rand seed
-    double runtime = 3; // Seconds before timeout interrupt & termination
     pid_t childpid; //holder for childpid, used when determining child fork
     char str_pct_id[20]; //string argument sent to users, holds shmid for pct
     char str_user_sim_pid[4]; // string arg for user's simulated pid (1-18)
     int user_sim_pid;
     int firstblocked;
     
-    // Set up ctrl^c interrupt handling
-    signal (SIGINT, siginthandler);
-    //set up interrupt timer
-    if (setinterrupt() == -1) {
-        perror("Failed to set up SIGALRM handler");
-        return 1;
-    }
-    // Set up periodic timer
-    if (setperiodic(runtime) == -1) {
-        perror("Failed to setup periodic interrupt");
-        return 1;
-    }
+    signal (SIGINT, siginthandler); // Set up interrupt handling
+    time_t start = time(NULL); //start the clock
     
-    //set up logging
+    // Set up logging
     mlog = fopen("master.log", "w");
     if (mlog == NULL) {
         perror("OSS: error opening log file");
@@ -176,6 +164,15 @@ int main(int argc, char** argv) {
     
     /********************* SCHEDULING ALGORITHM *******************************/
     while (1) {
+        //update timer and turn off user generation if needed
+        if (realTimeElapsed < runtimeAllowed) {
+            realTimeElapsed = (double)(time(NULL) - start);
+            if (realTimeElapsed >= runtimeAllowed) {
+                printf("OSS: Real-time limit of %f elapsed. No new users"
+                        "will be generated\n", runtimeAllowed);
+                allowNewUsers = 0;
+            }
+        }
         //if no new users are allowed and no users are left in the system, break
         if (allowNewUsers == 0 && numCurrentUsers == 0) {
             break;
@@ -188,9 +185,25 @@ int main(int argc, char** argv) {
 
         //get highest priority occupied queue number
         nextOccupiedQueue = getNextOccupiedQueue();
+        //if all queues are empty AND new user generation is turned off
+        //set time to next proc, advance sim clock that far, try again
+        if ( nextOccupiedQueue == -1 && allowNewUsers == 0) {
+            fprintf(mlog, "***NEW IF SECTION***\n");
+            setTimeToNextProc();
+            fprintf(mlog, "OSS: Current live users = %d\n", numCurrentUsers);
+            fprintf(mlog, "OSS: No processes ready to run, incrementing sim "
+                    "clock from %u:%09u to ", *simClock_secs, *simClock_ns);
+            incrementIdleTime();
+            *simClock_secs = spawnNextProcSecs;
+            *simClock_ns = spawnNextProcNS;
+            fprintf(mlog, "%u:%09u\n", *simClock_secs, *simClock_ns);
+            fflush(mlog);
+            continue;
+        }
         //if all queues are empty, advance system clock to next spawn time,
         //spawn a user, and schedule it
-        if ( nextOccupiedQueue == -1 ) {
+        else if ( nextOccupiedQueue == -1 ) {
+            fprintf(mlog, "OSS: Current live users = %d\n", numCurrentUsers);
             fprintf(mlog, "OSS: No processes ready to run, incrementing sim "
                     "clock from %u:%09u to ", *simClock_secs, *simClock_ns);
             incrementIdleTime();
@@ -237,6 +250,7 @@ int main(int argc, char** argv) {
                     infostruct.userTimeUsedLastBurst);
             terminateUser(infostruct.user_sim_pid);
             numCurrentUsers--;
+            printf("Users now alive: %d\n", numCurrentUsers);
         }
         //if the user was blocked on some event
         else if (infostruct.userBlockedFlag == 1) {
@@ -308,27 +322,7 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        
-        //spawn a user process if it's time AND we're allowing new users
-        /*
-        if (isTimeToSpawnProc() && (allowNewUsers == 1) ) {
-            //AND we're allowing new user spawns
-            if (getOpenBitVector() != -1) {
-                spawnNewUser();
-                numCurrentUsers++;
-            }
-            else {
-                fprintf(mlog, "OSS: New process spawn denied: "
-                        "Max spawn limit reached (100)\n");
-            }
-        }
-        //if it's time but there's no open space, only set a new time to spawn
-        else if (isTimeToSpawnProc() && (getOpenBitVector() == -1) ) {
-            fprintf(mlog, "OSS: New process spawn denied: process control "
-                    "table is full\n ");
-            setTimeToNextProc();
-        }
-        */
+
         //obtain highest priority occupied queue, get pid of first process
         //in that queue, attach appropriate time quantum, and move the
         //process to the back of the queue it's in, and schedule it
@@ -853,51 +847,6 @@ void printarrays() {
 }
 
 /********************* INTERRUPT HANDLING *************************************/
-
-//this function taken from UNIX text
-static int setperiodic(double sec) {
-    timer_t timerid;
-    struct itimerspec value;
-    
-    if (timer_create(CLOCK_REALTIME, NULL, &timerid) == -1)
-        return -1;
-    value.it_interval.tv_sec = (long)sec;
-    value.it_interval.tv_nsec = (sec - value.it_interval.tv_sec)*BILLION;
-    if (value.it_interval.tv_nsec >= BILLION) {
-        value.it_interval.tv_sec++;
-        value.it_interval.tv_nsec -= BILLION;
-    }
-    value.it_value = value.it_interval;
-    return timer_settime(timerid, 0, &value, NULL);
-}
-
-//this function taken from UNIX text
-static int setinterrupt() {
-    struct sigaction act;
-    
-    act.sa_flags = SA_SIGINFO;
-    act.sa_sigaction = interrupt;
-    if ((sigemptyset(&act.sa_mask) == -1) ||
-            (sigaction(SIGALRM, &act, NULL) == -1))
-        return -1;
-    return 0;
-}
-
-//action taken after timed interrupt is detected
-static void interrupt(int signo, siginfo_t *info, void *context) {
-    //killchildren();
-    //clearIPC();
-    //close log file
-    //if (mlog != NULL) {
-    //    fprintf(mlog, "OSS: Terminated: Timed Out\n");
-    //    fflush(mlog);
-        //fclose(mlog);
-    //}
-    printf("OSS: Timout detected, no new processes will be generated.\n");
-    printf("OSS: users currently alive: %d\n", numCurrentUsers);
-    fprintf(mlog, "OSS: Timeout detected, no new processes will be generated.\n");
-    allowNewUsers = 0;
-}
 
 //SIGINT handler
 static void siginthandler(int sig_num) {

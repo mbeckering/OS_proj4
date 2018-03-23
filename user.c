@@ -110,7 +110,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         //roll to get blocked
-        else if (roll < 24) {
+        else if (roll < 20) {
             //read sim clock
             localsec = *simClock_secs; 
             localns = *simClock_ns;

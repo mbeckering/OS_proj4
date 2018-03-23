@@ -7,7 +7,9 @@ couple projects got very long and I found myself scrolling through lots of
 code and struggling to find my core operations. I know over-using globals is 
 generally a bad thing, but I thought I would experiment this time around.
 
-Message Queues:
+Message Queue:
+One message queue serves as both communications channel and ensures only 
+one executable is "running" at a time, either a user or the OSS.
 OSS sends user messages of mytpe (1-18), representing the simulated pid of the 
 intended user recipient. User messages to the OSS are of type 99. This way 
 OSS never grabs messages that it put in the queue.
