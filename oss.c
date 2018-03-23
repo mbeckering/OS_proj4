@@ -15,6 +15,7 @@
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <sys/msg.h>
+#include <sys/wait.h>
 #include <sys/types.h>
 #include <signal.h>
 #include <sys/wait.h>
@@ -70,6 +71,8 @@ int shmid_pct; //shared memory id holder for process control table
 int oss_qid; //message queue ID for OSS communications
 int loglines = 0; //keeps track of lines in the log file
 int numProcsSpawned = 0;
+int allowNewUsers = 1;
+int numCurrentUsers = 0;
 static unsigned int *simClock_secs; //pointer to shm sim clock (seconds)
 static unsigned int *simClock_ns; //pointer to shm sim clock (nanoseconds)
 int arraysize = 19; //so I can use local sim pids 1-18 without confusion
@@ -173,9 +176,13 @@ int main(int argc, char** argv) {
     
     /********************* SCHEDULING ALGORITHM *******************************/
     while (1) {
+        //if no new users are allowed and no users are left in the system, break
+        if (allowNewUsers == 0 && numCurrentUsers == 0) {
+            break;
+        }
         //if any users are blocked, parse the queue and awaken 
-        //users if their time has come, placing them in the proper queue
-        if (isBlockedQueueEmpty() == 0) {
+        //  users if their time has come, placing them in the proper queue
+        if (isBlockedQueueEmpty() == 0) { 
             checkBlockedQueue();
         }
 
@@ -191,9 +198,10 @@ int main(int argc, char** argv) {
             *simClock_ns = spawnNextProcNS;
             fprintf(mlog, "%u:%09u\n", *simClock_secs, *simClock_ns);
             fflush(mlog);
-            if ( (numProcsSpawned < 100) && (getOpenBitVector() != -1) ) {
+            if ( (allowNewUsers == 1) && (getOpenBitVector() != -1) ) {
                 spawnNewUser(); //also sets new time for next proc spawn and
                                 //packs proper info into infostruct
+                numCurrentUsers++;
                 fprintf(mlog, "OSS: Dispatching process PID %d from queue %d at "
                     "time %u:%09u\n", infostruct.user_sim_pid ,
                         pct[infostruct.user_sim_pid].currentQueue,
@@ -228,6 +236,7 @@ int main(int argc, char** argv) {
                     "then terminated\n", infostruct.user_sim_pid,
                     infostruct.userTimeUsedLastBurst);
             terminateUser(infostruct.user_sim_pid);
+            numCurrentUsers--;
         }
         //if the user was blocked on some event
         else if (infostruct.userBlockedFlag == 1) {
@@ -285,11 +294,28 @@ int main(int argc, char** argv) {
             }
         }
         
-        //spawn a user process if it's time AND there's an open spot
-        if (isTimeToSpawnProc() && (getOpenBitVector() != -1) ) {
-            //AND we haven't exceeded 100 processes spawned
-            if (numProcsSpawned < 100) {
+        //code block to spawn new users
+        if (allowNewUsers == 1) {
+            if (isTimeToSpawnProc()) {
+                if (getOpenBitVector() != -1) {
+                    spawnNewUser();
+                    numCurrentUsers++;
+                }
+                else {
+                    fprintf(mlog, "OSS: New process spawn denied: "
+                            "process control table is full.\n");
+                    setTimeToNextProc();
+                }
+            }
+        }
+        
+        //spawn a user process if it's time AND we're allowing new users
+        /*
+        if (isTimeToSpawnProc() && (allowNewUsers == 1) ) {
+            //AND we're allowing new user spawns
+            if (getOpenBitVector() != -1) {
                 spawnNewUser();
+                numCurrentUsers++;
             }
             else {
                 fprintf(mlog, "OSS: New process spawn denied: "
@@ -302,6 +328,7 @@ int main(int argc, char** argv) {
                     "table is full\n ");
             setTimeToNextProc();
         }
+        */
         //obtain highest priority occupied queue, get pid of first process
         //in that queue, attach appropriate time quantum, and move the
         //process to the back of the queue it's in, and schedule it
@@ -355,6 +382,8 @@ int main(int argc, char** argv) {
     
     }
     
+    fprintf(mlog, "OSS: Terminated: Normal.\n");
+    fflush(mlog);
     clearIPC();
     printf("OSS: Normal exit\n");
 
@@ -490,6 +519,8 @@ void blockUser(int blockpid) {
 }
 
 void terminateUser(int termpid) {
+    int status;
+    waitpid(infostruct.user_sys_pid, &status, 0);
     if (pct[termpid].currentQueue == 0) {
         removeProcFromQueue(queue0, arraysize, termpid);
     }
@@ -569,6 +600,13 @@ void spawnNewUser() {
         exit(0);
     }
     numProcsSpawned++;
+    //flag for no new processes if we have spawned 100
+    if (numProcsSpawned >= 100) {
+        printf("OSS: 100 total users spawned. No new users will be spawned.\n");
+        fprintf(mlog, "OSS: 100 total users spawned. "
+                "No new users will be spawned.\n");
+        allowNewUsers = 0;
+    }
     infostruct.msgtyp = user_sim_pid;
     infostruct.userTerminatingFlag = 0;
     infostruct.userUsedFullTimeSliceFlag = 0;
@@ -847,17 +885,18 @@ static int setinterrupt() {
 
 //action taken after timed interrupt is detected
 static void interrupt(int signo, siginfo_t *info, void *context) {
-    printf("OSS: Timer Interrupt Detected! signo = %d\n", signo);
     //killchildren();
-    clearIPC();
+    //clearIPC();
     //close log file
-    if (mlog != NULL) {
-        fprintf(mlog, "OSS: Terminated: Timed Out\n");
-        fflush(mlog);
+    //if (mlog != NULL) {
+    //    fprintf(mlog, "OSS: Terminated: Timed Out\n");
+    //    fflush(mlog);
         //fclose(mlog);
-    }
-    printf("OSS: Terminated: Timed Out\n");
-    exit(0);
+    //}
+    printf("OSS: Timout detected, no new processes will be generated.\n");
+    printf("OSS: users currently alive: %d\n", numCurrentUsers);
+    fprintf(mlog, "OSS: Timeout detected, no new processes will be generated.\n");
+    allowNewUsers = 0;
 }
 
 //SIGINT handler

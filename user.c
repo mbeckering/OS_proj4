@@ -95,7 +95,7 @@ int main(int argc, char** argv) {
     while(1) {
         if ( msgrcv(oss_qid, &myinfo, sizeof(myinfo), my_sim_pid, 0) == -1 ) {
             //perror("User: error in msgrcv");
-            printf("User %02d Terminated: Interrupted\n", my_sim_pid);
+            printf("User %02d Terminated: OSS removed message queue.\n", my_sim_pid);
             exit(0);
         }
         myinfo.user_sys_pid = getpid();
