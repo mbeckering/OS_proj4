@@ -45,7 +45,7 @@ void incrementSimClockAfterMessageReceipt(int);
 void spawnNewUser();
 void terminateUser(int);
 void blockUser(int);
-void checkBlockedQueue();
+int checkBlockedQueue(); //returns # of users unblocked
 void awakenUser(int);
 int isBlockedQueueEmpty();
 int incrementIdleTime();
@@ -70,6 +70,7 @@ int loglines = 0; //keeps track of lines in the log file
 int numProcsSpawned = 0;
 int allowNewUsers = 1;
 int numCurrentUsers = 0;
+int numProcsUnblocked;
 static unsigned int *simClock_secs; //pointer to shm sim clock (seconds)
 static unsigned int *simClock_ns; //pointer to shm sim clock (nanoseconds)
 int arraysize = 19; //so I can use local sim pids 1-18 without confusion
@@ -124,6 +125,7 @@ struct pcb * pct; //pct = process control table (array of 18 process
 /************************************ MAIN ************************************/
 
 int main(int argc, char** argv) {
+    int finishThem = 0;
     int i; //the great iterator
     double realTimeElapsed = 0;
     double runtimeAllowed = 3; // Seconds before timeout interrupt & termination
@@ -168,29 +170,33 @@ int main(int argc, char** argv) {
         if (realTimeElapsed < runtimeAllowed) {
             realTimeElapsed = (double)(time(NULL) - start);
             if (realTimeElapsed >= runtimeAllowed) {
-                printf("OSS: Real-time limit of %f elapsed. No new users"
+                printf("OSS: Real-time limit of %f has elapsed. No new users"
                         "will be generated\n", runtimeAllowed);
                 allowNewUsers = 0;
             }
         }
         //if no new users are allowed and no users are left in the system, break
         if (allowNewUsers == 0 && numCurrentUsers == 0) {
+            printf("OSS: User generation is disallowed and "
+                    "all users have terminated.\n");
+            fprintf(mlog, "OSS: User generation is disallowed and "
+                    "all users have terminated.\n");
             break;
         }
-        //if any users are blocked, parse the queue and awaken 
+        //if any users are blocked, parse the blocked queue and awaken 
         //  users if their time has come, placing them in the proper queue
+        numProcsUnblocked = 0;
         if (isBlockedQueueEmpty() == 0) { 
-            checkBlockedQueue();
+            numProcsUnblocked = checkBlockedQueue();
         }
 
         //get highest priority occupied queue number
         nextOccupiedQueue = getNextOccupiedQueue();
-        //if all queues are empty AND new user generation is turned off
-        //set time to next proc, advance sim clock that far, try again
-        if ( nextOccupiedQueue == -1 && allowNewUsers == 0) {
-            fprintf(mlog, "***NEW IF SECTION***\n");
+        //if non-blocked queues are empty AND new user generation is turned off
+        //then only blocked processes remain, need to change strategy.
+        //set time to next proc spawn, advance sim clock that far
+        if ( (nextOccupiedQueue == -1) && (allowNewUsers == 0) ) {
             setTimeToNextProc();
-            fprintf(mlog, "OSS: Current live users = %d\n", numCurrentUsers);
             fprintf(mlog, "OSS: No processes ready to run, incrementing sim "
                     "clock from %u:%09u to ", *simClock_secs, *simClock_ns);
             incrementIdleTime();
@@ -198,11 +204,15 @@ int main(int argc, char** argv) {
             *simClock_ns = spawnNextProcNS;
             fprintf(mlog, "%u:%09u\n", *simClock_secs, *simClock_ns);
             fflush(mlog);
-            continue;
+            //if a user was not unblocked, restart algo and see if it's time
+            if (numProcsUnblocked == 0) {
+                finishThem = 1;
+                continue;
+            }
         }
-        //if all queues are empty, advance system clock to next spawn time,
-        //spawn a user, and schedule it
-        else if ( nextOccupiedQueue == -1 ) {
+        //if active queues are empty, and new user spawns are allowed, 
+        //advance system clock to next spawn time, spawn a user, and schedule it
+        else if ( nextOccupiedQueue == -1 && allowNewUsers == 1 ) {
             fprintf(mlog, "OSS: Current live users = %d\n", numCurrentUsers);
             fprintf(mlog, "OSS: No processes ready to run, incrementing sim "
                     "clock from %u:%09u to ", *simClock_secs, *simClock_ns);
@@ -226,6 +236,44 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        //this block of code exists to prevent a hang that was occuring
+        //after a process awoke from the blocked queue under the conditions
+        //that only blocked processes remain in the system and no new
+        //process generation is allowed. I should have structured my entire
+        //algorightm differently to prevent this, but i'm OUT OF TIME!
+        else if ( finishThem == 1 && nextOccupiedQueue != -1) {
+            finishThem = 0;
+                if (nextOccupiedQueue == 0) {
+                    nextProcToRun = getNextProcFromQueue(queue0);
+                    infostruct.ossTimeSliceGivenNS = quantum_0;
+                    removeProcFromQueue(queue0, arraysize, nextProcToRun);
+                    addProcToQueue(queue0, arraysize, nextProcToRun);
+                }
+                else if (nextOccupiedQueue == 1) {
+                    nextProcToRun = getNextProcFromQueue(queue1);
+                    infostruct.ossTimeSliceGivenNS = quantum_1;
+                    removeProcFromQueue(queue1, arraysize, nextProcToRun);
+                    addProcToQueue(queue1, arraysize, nextProcToRun);
+                }
+                //else continue;
+                if (nextProcToRun != -1) {
+                    infostruct.msgtyp = (long) nextProcToRun;
+                    infostruct.userTerminatingFlag = 0;
+                    infostruct.userUsedFullTimeSliceFlag = 0;
+                    infostruct.userBlockedFlag = 0;
+                    infostruct.user_sim_pid = nextProcToRun;
+                    fprintf(mlog, "OSS: Dispatching process PID %d from queue %d at "
+                    "time %u:%09u\n", nextProcToRun, 
+                    pct[nextProcToRun].currentQueue, 
+                    *simClock_secs, *simClock_ns);
+                    if ( msgsnd(oss_qid, &infostruct, sizeof(infostruct), 0) == -1 ) {
+                        perror("OSS: error sending user msg");
+                        clearIPC();
+                        exit(0);
+                    }
+                }
+        }
+        
         
         firstblocked = blocked[1]; //ghetto bug fix
         //wait for a message from any user (Always msgtyp 99)
@@ -249,8 +297,6 @@ int main(int argc, char** argv) {
                     "then terminated\n", infostruct.user_sim_pid,
                     infostruct.userTimeUsedLastBurst);
             terminateUser(infostruct.user_sim_pid);
-            numCurrentUsers--;
-            printf("Users now alive: %d\n", numCurrentUsers);
         }
         //if the user was blocked on some event
         else if (infostruct.userBlockedFlag == 1) {
@@ -308,7 +354,7 @@ int main(int argc, char** argv) {
             }
         }
         
-        //code block to spawn new users
+        //if it's time, and it's allowed, spawn a new user
         if (allowNewUsers == 1) {
             if (isTimeToSpawnProc()) {
                 if (getOpenBitVector() != -1) {
@@ -357,6 +403,7 @@ int main(int argc, char** argv) {
         else {
             continue;
         }
+        //schedule next user
         if (nextProcToRun != -1) {
             infostruct.msgtyp = (long) nextProcToRun;
             infostruct.userTerminatingFlag = 0;
@@ -425,7 +472,8 @@ int isBlockedQueueEmpty() {
 
 //compares sim clock with "blocked-until" times of each occupied
 //slot in the blocked queue and wakes them up if it's time
-void checkBlockedQueue() {
+int checkBlockedQueue() {
+    int returnval = 0;
     int j;
     //read current simclock
     unsigned int localsec = *simClock_secs;
@@ -441,9 +489,11 @@ void checkBlockedQueue() {
                 //then AWAKEN HIIIIIIIIIIM!!!!
                 //printf("OSS: Calling awakenUser(%d) ... ", blocked[j]);
                 awakenUser(blocked[j]);
+                returnval++;
             }
         }
     }
+    return returnval;
 }
 
 void awakenUser(int wakepid) {
@@ -528,6 +578,9 @@ void terminateUser(int termpid) {
         removeProcFromQueue(queue3, arraysize, termpid);
     }
     bitVector[termpid] = 0;
+    numCurrentUsers--;
+    printf("OSS: User %d has terminated. Users alive: %d\n",
+        infostruct.user_sim_pid, numCurrentUsers);
 }
 
 int getNextOccupiedQueue() {
@@ -596,9 +649,10 @@ void spawnNewUser() {
     numProcsSpawned++;
     //flag for no new processes if we have spawned 100
     if (numProcsSpawned >= 100) {
-        printf("OSS: 100 total users spawned. No new users will be spawned.\n");
+        printf("OSS: 100 total users spawned. No new users will be "
+                "generated after this one.\n");
         fprintf(mlog, "OSS: 100 total users spawned. "
-                "No new users will be spawned.\n");
+                "No new users will be generated after this one.\n");
         allowNewUsers = 0;
     }
     infostruct.msgtyp = user_sim_pid;
@@ -741,7 +795,6 @@ void makePCB(int pidnum, int isRealTime) {
 
 //initialize bit vector based on specified size
 void initBitVector(int n) {
-    printf("OSS: Initializing bit vector\n");
     int i;
     for (i=0; i<n; i++) {
         bitVector[i] = 0;
@@ -822,6 +875,7 @@ void initQueue(int q[], int size) {
 
 void printarrays() {
     //printing shit for testing
+    fprintf(mlog, "Users allegedly alive: %d\n", numCurrentUsers);
     int i;
         fprintf(mlog, "Q0-");
         for (i=1; i<arraysize; i++) {

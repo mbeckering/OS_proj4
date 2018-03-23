@@ -106,11 +106,10 @@ int main(int argc, char** argv) {
             //roll a portion of timeslice to use before terminating
             myinfo.userTimeUsedLastBurst = randomPortionOfTimeSlice();
             reportTermination();
-            printf("User %d rolled to terminate.\n", my_sim_pid);
             return 1;
         }
         //roll to get blocked
-        else if (roll < 20) {
+        else if (roll < 17) {
             //read sim clock
             localsec = *simClock_secs; 
             localns = *simClock_ns;
@@ -120,7 +119,7 @@ int main(int argc, char** argv) {
             reportBlocked();
         }
         //roll to get preempted
-        else if (roll < 250) {
+        else if (roll < 260) {
             reportPreempted();
         }
         else {
@@ -214,7 +213,6 @@ void getIPC() {
         exit(1);
     }
     
-    //printf("User: getting shared memory\n");
     //sim clock: seconds (READ ONLY)
     shmid_sim_secs = shmget(SHMKEY_sim_s, BUFF_SZ, 0444);
         if (shmid_sim_secs == -1) { //terminate if shmget failed

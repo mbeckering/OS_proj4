@@ -1,11 +1,23 @@
+Mike Beckering
+OS Project 4: Process scheduler simulation
+One round-robin queue for real-time processes
+One three-level feedback queue
+One blocked queue
+
 Version control link:
 https://github.com/mbeckering/OS_proj4.git
+
+Reading log output:
+In order to find rarer events, I suggest ctrl+f-ing the log for keywords such
+as "blocked", "waking", and "queue 0" (to identify real-time processes).
+Statistics are shown at the very end. I may also print stats to stdout.
 
 Globals:
 I used a LOT of globals in order to delegate more work to functions. The last 
 couple projects got very long and I found myself scrolling through lots of 
 code and struggling to find my core operations. I know over-using globals is 
-generally a bad thing, but I thought I would experiment this time around.
+generally a bad thing, but I thought I would experiment this time around. It
+worked well, but feels dirty.
 
 Message Queue:
 One message queue serves as both communications channel and ensures only 
