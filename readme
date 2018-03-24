@@ -7,10 +7,20 @@ One blocked queue
 Version control link:
 https://github.com/mbeckering/OS_proj4.git
 
-Reading log output:
+*COULD NOT STOP IDENTICAL BLOCKED ROLLS DESPITE GREAT EFFORT* The log output
+is not faked.
+
+This was a hard project and my code is messy. But it works, and time's up.
+
+Log & stats:
+Stats are at the end. I'm not sure they make a ton of sense. I could NOT stop
+the users from rolling the same amount of time to be blocked, fought it for
+hours. I also don't see how wait time and life time are always so close. But
+the scheduler operates all the queues perfectly and you can see that in log.
 In order to find rarer events, I suggest ctrl+f-ing the log for keywords such
 as "blocked", "waking", and "queue 0" (to identify real-time processes).
-Statistics are shown at the very end. I may also print stats to stdout.
+You can also add printarrays(); anywhere in the scheduling algorithm, and it
+will print a crude visual representation of all 5 queues to the log.
 
 Globals:
 I used a LOT of globals in order to delegate more work to functions. The last 
@@ -19,9 +29,16 @@ code and struggling to find my core operations. I know over-using globals is
 generally a bad thing, but I thought I would experiment this time around. It
 worked well, but feels dirty.
 
+Random rolls:
+Some of my random rolls were not as random as I would have liked, especially
+the blocked wait rolls. I'm not sure what I could do better with all the
+concurrency happening, lots of them roll the same blocked wait time, even
+if I used rand_r and keep using the updated seeds after every loop.
+
 Message Queue:
 One message queue serves as both communications channel and ensures only 
 one executable is "running" at a time, either a user or the OSS.
 OSS sends user messages of mytpe (1-18), representing the simulated pid of the 
 intended user recipient. User messages to the OSS are of type 99. This way 
 OSS never grabs messages that it put in the queue.
+

@@ -80,6 +80,9 @@ int queue2[19]; //medium-priority queue
 int queue3[19]; //low-priority queue
 unsigned int idleTime_secs = 0;
 unsigned int idleTime_ns = 0;
+unsigned int totalUserLifetime_secs, totalUserLifetime_ns;
+unsigned int totalWaitTime_secs, totalWaitTime_ns;
+unsigned int totalBlockedTime_secs, totalBlockedTime_ns;
 
 int blocked[19]; //blocked queue
 int nextProcToRun, nextOccupiedQueue;
@@ -92,14 +95,19 @@ unsigned int quantum_2 = 8000000;
 unsigned int quantum_3 = 16000000;
 
 struct pcb { // Process control block struct
+    unsigned int startTime_secs;
+    unsigned int startTime_ns;
     unsigned int totalCPUtime_secs;
     unsigned int totalCPUtime_ns;
     unsigned int totalLIFEtime_secs;
     unsigned int totalLIFEtime_ns;
     unsigned int timeUsedLastBurst_ns;
     int blocked;  // 1=blocked, 0= not blocked
+    int timesBlocked;
     unsigned int blockedUntilSecs;
     unsigned int blockedUntilNS;
+    unsigned int totalBlockedTime_secs;
+    unsigned int totalBlockedTime_ns;
     int localPID;
     int isRealTimeClass; // 1 = realtime class process
     int currentQueue;
@@ -240,7 +248,7 @@ int main(int argc, char** argv) {
         //after a process awoke from the blocked queue under the conditions
         //that only blocked processes remain in the system and no new
         //process generation is allowed. I should have structured my entire
-        //algorightm differently to prevent this, but i'm OUT OF TIME!
+        //algorigthm differently to prevent this, but i'm OUT OF TIME!
         else if ( finishThem == 1 && nextOccupiedQueue != -1) {
             finishThem = 0;
                 if (nextOccupiedQueue == 0) {
@@ -422,7 +430,27 @@ int main(int argc, char** argv) {
         }
     
     }
-    
+    //print them lucious stats
+    fprintf(mlog, "OSS: Normal termination at %u:%09u\n", 
+                *simClock_secs, *simClock_ns);
+    fprintf(mlog, "OSS: Total users generated: %d\n", numProcsSpawned);
+    fprintf(mlog, "OSS: Total CPU idle time: %u:%09u\n", 
+                idleTime_secs, idleTime_ns);
+    fprintf(mlog, "OSS: Total user lifetime: %u:%09u\n", 
+                totalUserLifetime_secs, totalUserLifetime_ns);
+    double x = (double)totalUserLifetime_ns/BILLION;
+    double y = (double)totalUserLifetime_secs + x;
+    fprintf(mlog, "OSS: Average user lifetime: %.9f seconds.\n", y / numProcsSpawned);
+    fprintf(mlog, "OSS: Total user wait time: %u:%09u\n", 
+                totalWaitTime_secs, totalWaitTime_ns);
+    x = (double)totalWaitTime_ns/BILLION;
+    y = (double)totalWaitTime_secs + x;
+    fprintf(mlog, "OSS: Average user wait time: %.9f seconds.\n", y / numProcsSpawned);
+    fprintf(mlog, "OSS: Total user blocked(sleep) time: %u:%09u seconds.\n", 
+                totalBlockedTime_secs, totalBlockedTime_ns);
+    x = (double)totalBlockedTime_ns/BILLION;
+    y = (double)totalBlockedTime_secs + x;
+    fprintf(mlog, "OSS: Average user blocked(sleep) time: %.9f seconds.\n", y / numProcsSpawned);
     fprintf(mlog, "OSS: Terminated: Normal.\n");
     fflush(mlog);
     clearIPC();
@@ -531,6 +559,14 @@ void awakenUser(int wakepid) {
 void blockUser(int blockpid) {
     int temp;
     unsigned int localsec, localns;
+    //update stats for blocked time
+    totalBlockedTime_secs += pct[blockpid].totalBlockedTime_secs;
+    totalBlockedTime_ns += pct[blockpid].totalBlockedTime_ns;
+    if (totalBlockedTime_ns >= BILLION) {
+        totalBlockedTime_secs++;
+        temp = totalBlockedTime_ns - BILLION;
+        totalBlockedTime_ns = temp;
+    }
     //remove from current queue
     pct[blockpid].blocked = 1;
     if (pct[blockpid].currentQueue == 0)
@@ -564,7 +600,29 @@ void blockUser(int blockpid) {
 
 void terminateUser(int termpid) {
     int status;
+    unsigned int temp;
     waitpid(infostruct.user_sys_pid, &status, 0);
+    //add user's life time to total
+    totalUserLifetime_secs += pct[termpid].totalLIFEtime_secs;
+    totalUserLifetime_ns += pct[termpid].totalLIFEtime_ns;
+    if (totalUserLifetime_ns >= BILLION) {
+        totalUserLifetime_secs++;
+        temp = totalUserLifetime_ns - BILLION;
+        totalUserLifetime_ns = temp;
+    }
+    //add user's wait time to total
+    
+    totalWaitTime_secs += 
+            (pct[termpid].totalLIFEtime_secs - pct[termpid].totalCPUtime_secs);
+    totalWaitTime_ns +=
+            (pct[termpid].totalLIFEtime_ns - pct[termpid].totalCPUtime_ns);
+    if (totalWaitTime_ns >= BILLION) {
+        totalWaitTime_secs++;
+        temp = totalWaitTime_ns - BILLION;
+        totalWaitTime_ns = temp;
+    }
+    
+    
     if (pct[termpid].currentQueue == 0) {
         removeProcFromQueue(queue0, arraysize, termpid);
     }
@@ -579,6 +637,10 @@ void terminateUser(int termpid) {
     }
     bitVector[termpid] = 0;
     numCurrentUsers--;
+    pct[termpid].totalCPUtime_secs = 0;
+    pct[termpid].totalCPUtime_ns = 0;
+    pct[termpid].totalLIFEtime_secs = 0;
+    pct[termpid].totalLIFEtime_ns = 0;
     printf("OSS: User %d has terminated. Users alive: %d\n",
         infostruct.user_sim_pid, numCurrentUsers);
 }
@@ -773,14 +835,19 @@ int getOpenBitVector() {
 void makePCB(int pidnum, int isRealTime) {
     unsigned int localsec = *simClock_secs;
     unsigned int localns = *simClock_ns;
+    pct[pidnum].startTime_secs = 0;
+    pct[pidnum].startTime_ns = 0;
     pct[pidnum].totalCPUtime_secs = 0;
     pct[pidnum].totalCPUtime_ns = 0;
     pct[pidnum].totalLIFEtime_secs = 0;
     pct[pidnum].totalLIFEtime_ns = 0;
     pct[pidnum].timeUsedLastBurst_ns = 0;
     pct[pidnum].blocked = 0;
+    pct[pidnum].timesBlocked = 0;
     pct[pidnum].blockedUntilSecs = 0;
     pct[pidnum].blockedUntilNS = 0;
+    pct[pidnum].totalBlockedTime_secs = 0;
+    pct[pidnum].totalBlockedTime_ns = 0;
     pct[pidnum].localPID = pidnum; //pids will be 1-18
     pct[pidnum].isRealTimeClass = isRealTime;
     //place into round-robin queue if realtime, else queue1

@@ -31,6 +31,9 @@ void reportTermination();
 void reportBlocked();
 void reportPreempted();
 unsigned int randomPortionOfTimeSlice();
+void compileStats();
+void incrementCPUtime();
+void incrementBlockedTime();
 
 /***************************** GLOBALS ***************************************/
 int shmid_sim_secs, shmid_sim_ns; //shared memory ID holders for sim clock
@@ -38,19 +41,26 @@ int shmid_pct; //shared memory id holder for process control table
 int oss_qid; //message queue ID for OSS communications
 static unsigned int *simClock_secs; 
 static unsigned int *simClock_ns; //pointers to shm sim clock values
-unsigned int myStartTimeSecs, myStartTimeNS; //to deduce my LIFEtime later
+unsigned int myStartTimeSecs;
+unsigned int myStartTimeNS; //to deduce my LIFEtime later
 int my_sim_pid; //this user's simulated pid (1-18)
 int seed;
+unsigned int b_sec, b_ns;
 
 struct pcb { // Process control block struct
+    unsigned int startTime_secs;
+    unsigned int startTime_ns;
     unsigned int totalCPUtime_secs;
     unsigned int totalCPUtime_ns;
     unsigned int totalLIFEtime_secs;
     unsigned int totalLIFEtime_ns;
     unsigned int timeUsedLastBurst_ns;
     int blocked; // 1=blocked, 0= not blocked
+    int timesBlocked;
     unsigned int blockedUntilSecs;
     unsigned int blockedUntilNS;
+    unsigned int totalBlockedTime_secs;
+    unsigned int totalBlockedTime_ns;
     int localPID;
     int isRealTimeClass; // 1 = realtime class process
     int currentQueue;
@@ -80,6 +90,7 @@ int main(int argc, char** argv) {
     shmid_pct = atoi(argv[1]);
     my_sim_pid = atoi(argv[2]);
     int roll;
+    //pct[my_sim_pid].timesBlocked = 0;
     
     // Set up interrupt handler
     signal (SIGINT, siginthandler);
@@ -88,8 +99,8 @@ int main(int argc, char** argv) {
     
     //get IPC info and read clock for my start time
     getIPC();
-    myStartTimeSecs = *simClock_secs; 
-    myStartTimeNS = *simClock_ns;
+    pct[my_sim_pid].startTime_secs = *simClock_secs; 
+    pct[my_sim_pid].startTime_ns = *simClock_ns;
     
     /*********************USER OPERATIONS ALGORITHM ***************************/
     while(1) {
@@ -98,13 +109,15 @@ int main(int argc, char** argv) {
             printf("User %02d Terminated: OSS removed message queue.\n", my_sim_pid);
             exit(0);
         }
-        myinfo.user_sys_pid = getpid();
+        myinfo.user_sys_pid = getpid(); //for wait() in OSS
         
         //roll to terminate
         roll = roll1000();
         if (roll < 15) {
             //roll a portion of timeslice to use before terminating
             myinfo.userTimeUsedLastBurst = randomPortionOfTimeSlice();
+            incrementCPUtime();
+            compileStats();
             reportTermination();
             return 1;
         }
@@ -113,9 +126,13 @@ int main(int argc, char** argv) {
             //read sim clock
             localsec = *simClock_secs; 
             localns = *simClock_ns;
-            //set a time 0-5:0-1000 to be unblocked in process control block
-            pct[my_sim_pid].blockedUntilSecs = localsec + (rand_r(&seed) % 5 + 1);
-            pct[my_sim_pid].blockedUntilNS = localns + (rand_r(&seed) % 1000 + 1);
+            //set a time 0-5 : 0-1000 to be unblocked in process control block
+            b_ns = rand_r(&seed) % 1000 + 1;
+            b_sec = rand_r(&seed) % 5 + 1;
+            pct[my_sim_pid].blockedUntilSecs = localsec + b_sec;
+            pct[my_sim_pid].blockedUntilNS = localns + b_ns;
+            incrementBlockedTime();
+            pct[my_sim_pid].timesBlocked++;
             reportBlocked();
         }
         //roll to get preempted
@@ -135,9 +152,64 @@ int main(int argc, char** argv) {
 
 /************************************* FUNCTIONS ******************************/
 
+void incrementBlockedTime() {
+    unsigned int now_secs = *simClock_secs;
+    unsigned int now_ns = *simClock_ns;
+    unsigned int temp = 0;
+    
+    pct[my_sim_pid].totalBlockedTime_secs += b_sec; 
+    pct[my_sim_pid].totalBlockedTime_ns += b_ns;
+    if (pct[my_sim_pid].totalBlockedTime_ns >= BILLION) {
+        pct[my_sim_pid].totalBlockedTime_secs++;
+        temp = pct[my_sim_pid].totalBlockedTime_ns - BILLION;
+        pct[my_sim_pid].totalBlockedTime_ns = temp;
+    }
+            
+            
+}
+
+//increments the PCB with the rolling total of "work" time
+void incrementCPUtime() {
+    unsigned int temp = 0;
+    pct[my_sim_pid].totalCPUtime_ns += myinfo.userTimeUsedLastBurst;
+    if (pct[my_sim_pid].totalCPUtime_ns >= BILLION) {
+        pct[my_sim_pid].totalCPUtime_secs++;
+        temp = pct[my_sim_pid].totalCPUtime_ns - BILLION;
+        pct[my_sim_pid].totalCPUtime_ns = temp;
+    }
+}
+
+void compileStats() {
+    
+    //total simulated life time
+    unsigned int myEndTimeSecs = *simClock_secs; 
+    unsigned int myEndTimeNS = *simClock_ns;
+    unsigned int temp;
+
+    if (myEndTimeSecs == pct[my_sim_pid].startTime_secs) {
+        pct[my_sim_pid].totalLIFEtime_ns = 
+                (myEndTimeNS - pct[my_sim_pid].startTime_ns);
+        pct[my_sim_pid].totalLIFEtime_secs = 0;
+    }
+    else {
+        pct[my_sim_pid].totalLIFEtime_secs = 
+                myEndTimeSecs - pct[my_sim_pid].startTime_secs;
+        pct[my_sim_pid].totalLIFEtime_ns = 
+                myEndTimeNS + (BILLION - pct[my_sim_pid].startTime_ns);
+        pct[my_sim_pid].totalLIFEtime_secs--;
+    }
+    if (pct[my_sim_pid].totalLIFEtime_ns >= BILLION) {
+        pct[my_sim_pid].totalLIFEtime_secs++;
+        temp = pct[my_sim_pid].totalLIFEtime_ns - BILLION;
+        pct[my_sim_pid].totalLIFEtime_ns = temp;
+    }
+    
+}
+
 //packs appropriate information into struct and sends vis message queue
 //if this user has finished all of its given timeslice for this burst
 void reportFinishedTimeSlice() {
+    incrementCPUtime();
     myinfo.userBlockedFlag = 0;
     myinfo.userTerminatingFlag = 0;
     myinfo.userUsedFullTimeSliceFlag = 1;
@@ -155,6 +227,7 @@ void reportPreempted() {
     myinfo.userTerminatingFlag = 0;
     myinfo.userUsedFullTimeSliceFlag = 0;
     myinfo.userTimeUsedLastBurst = randomPortionOfTimeSlice();
+    incrementCPUtime();
     myinfo.user_sim_pid = my_sim_pid;
     myinfo.msgtyp = 99;
     if ( msgsnd(oss_qid, &myinfo, sizeof(myinfo), 0) == -1 ) {
@@ -191,6 +264,7 @@ void reportBlocked() {
     myinfo.userUsedFullTimeSliceFlag = 0;
     //use 1-99ns before getting preempted by blocking event
     myinfo.userTimeUsedLastBurst = rand_r(&seed) % 99 + 1;
+    incrementCPUtime();
     myinfo.userBlockedFlag = 1;
     if ( msgsnd(oss_qid, &myinfo, sizeof(myinfo), 0) == -1 ) {
         perror("User: error sending msg to oss");
